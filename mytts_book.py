@@ -430,7 +430,8 @@ class Extractor:
         if at_start:
             return self.capital_inside[k] > 0 or (tagged and self.lower[k] == 0) or (
                 self.normal_inside[self.first(word).normal_form.replace("ё", "е")] >= 2 and self.lower[k] == 0)
-        return tagged or (self.capital_inside[k] >= 1 and self.lower[k] == 0)
+        # «Медуза» — прозвище: в тексте есть и «медуза» строчными, но с заглавной внутри предложения чаще.
+        return tagged or self.capital_inside[k] >= 2 or (self.capital_inside[k] >= 1 and self.lower[k] == 0)
 
     POSSESSIVE = re.compile(r"^(.{2,}?)[иы]н(?:а|о|ы|ой|ою|ому|ым|ом|ых|ыми|у|е)?$")
 
@@ -455,7 +456,10 @@ class Extractor:
             options = [[p for p in opt if p.tag.gender == expected_gender] or opt for opt in options]
         # «Улямов», «Бахмутов» словарь разбирает только как множественное («Улям», «Бахмут»), но это фамилия
         # одного человека; «Бобриковы», «Бобриковых» — семья, даже если словарь фамилии не знает.
-        surname_nom = [bool(SINGLE_SURNAME.search(w.lower())) and bool(self.named(w)) and not opt
+        # «Санек» словарь видит как множественное от «Санька», но семья — только фамилия во множественном:
+        # имя или прозвище без единственного разбора — один человек, ключ — как написано.
+        surname_nom = [bool(self.named(w)) and not opt and (bool(SINGLE_SURNAME.search(w.lower())) or
+                       not any("Surn" in p.tag.grammemes for p in self.named(w)))
                        for w, opt in zip(words, options)]
         family = any((self.named(w) and not opt and not single) or (not self.named(w) and FAMILY_SURNAME.search(w.lower()))
                      for w, opt, single in zip(words, options, surname_nom))
@@ -472,7 +476,8 @@ class Extractor:
             low = w.lower().replace("ё", "е")
             if single:
                 keys.append(low)
-                info.append(("m", "Surn"))
+                is_surname = any("Surn" in p.tag.grammemes for p in self.named(w))
+                info.append(("m" if is_surname else None, "Surn" if is_surname else "Name"))
                 continue
             if not opt and not self.named(w) and FAMILY_SURNAME.search(low):
                 keys.append(FAMILY_SURNAME.sub(lambda m: m.group(1), low))  # «бобриковых» → «бобриков»
@@ -717,8 +722,8 @@ class Extractor:
             clause = re.split(r"[.!?…;:(]", part, maxsplit=1)[0][:180]
             inside = [m for m in mentions if start <= m.start < start + len(clause)
                       and m.end <= start + len(clause) and m.nominative and m.cand.kind != "family"]
-            verbs = [(w, self.first(w.group())) for w in WORD.finditer(clause)]
-            verbs = [(w, p) for w, p in verbs if p.tag.POS == "VERB" and "past" in p.tag.grammemes]
+            verbs = [(w, self.past_verb(w.group())) for w in WORD.finditer(clause)]
+            verbs = [(w, p) for w, p in verbs if p is not None]
             if not inside:
                 if describe and verbs:
                     self.describe_speaker(clause, start, verbs[0], describe)
@@ -730,12 +735,13 @@ class Extractor:
                     gap = clause[left[1]:right[0]]
                     if len(gap) > 48 or re.search(r"[.:;!?…]", gap):
                         continue
-                    if "," in gap and not all(self.first(x.group()).tag.POS in ("ADVB", "PRCL", "CONJ", "PRED")
-                                              for x in WORD.finditer(gap)):
+                    if "," in gap and not self.parenthetical(gap, mention.start - start > w.start()):
                         continue  # «— удивился, наконец, Рогожин» — да; «— сказал он, и Рогожин…» — нет
                     if any(other != mention and left[1] <= other.start-start < right[0] for other in inside):
                         continue
                     pairs.append(("," in gap, len(gap), mention, parsed))
+            if not pairs:
+                pairs = self.sole_speaker(clause, start, inside, verbs)
             if not pairs:
                 continue
             *_, mention, verb = min(pairs, key=lambda pair: pair[:2])
@@ -744,6 +750,40 @@ class Extractor:
             speaker.speaker_sections[getattr(self, "section", 0)] += 1
             if verb.tag.gender in ("masc", "femn"):
                 speaker.genders["verb:" + ("f" if verb.tag.gender == "femn" else "m")] += 1
+
+    def past_verb(self, word: str):
+        """Разбор глаголом прошедшего времени, если он среди разборов: «орал» словарь первым видит как «орала»."""
+        if word not in self.cache:
+            self.cache[word] = self.morph.parse(word)
+        return next((p for p in self.cache[word][:3] if p.tag.POS == "VERB" and "past" in p.tag.grammemes), None)
+
+    def sole_speaker(self, clause: str, start: int, inside: list, verbs: list) -> list:
+        """В ремарке назван ровно один человек, род первого глагола с ним согласуется и между ними нет другого
+        глагола: «— завороженно сказал ещё красный и мокрый от слёз … Павлуша», «— Антоша, продолжая обыскивать
+        карманы, машинально сунул…». Иначе говорящий неизвестен."""
+        people = {id(m.cand): m for m in inside}
+        if len(people) != 1 or not verbs:
+            return []
+        mention = next(iter(people.values()))
+        w, verb = verbs[0]
+        left, right = sorted(((mention.start - start, mention.end - start), (w.start(), w.end())))
+        if right[0] - left[1] > 150 or any(left[1] <= x.start() < right[0] for x, _ in verbs[1:]):
+            return []
+        genders = {p.tag.gender for p in self.named(clause[mention.start - start:mention.end - start].split()[-1])}
+        if verb.tag.gender in ("masc", "femn") and genders and verb.tag.gender not in genders:
+            return []
+        return [(True, right[0] - left[1], mention, verb)]
+
+    def parenthetical(self, gap: str, name_after_verb: bool) -> bool:
+        """Между глаголом и говорящим — только вводное в запятых: наречие, частица, деепричастие
+        («— бормотала, улыбаясь, баба Катя»); перед самим именем ещё может стоять одно существительное
+        без запятой («баба Катя», «тётя Маша»)."""
+        words = list(WORD.finditer(gap))
+        if name_after_verb and words and "," not in gap[words[-1].end():]:
+            last = self.first(words[-1].group())
+            if last.tag.POS == "NOUN" and last.tag.case == "nomn":
+                words = words[:-1]
+        return all(self.first(x.group()).tag.POS in ("ADVB", "PRCL", "CONJ", "PRED", "GRND") for x in words)
 
     def describe_speaker(self, clause: str, start: int, verb, describe) -> None:
         """Сразу после глагола речи — существительное-лицо или субстантивное прилагательное в именительном
@@ -1856,8 +1896,8 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
             if votes is None or ref not in ch["candidates"]:
                 continue
             keep, own, known = label_decision(votes, ch["source_id"])
-            if keep and (candidates[ref]["kind"] != "title" or len(ch["candidates"]) > 1):
-                continue
+            if keep:
+                continue  # и персонаж из одного обращения («мама», «бабушка»), если отрывки подтвердили его
             rivals = ", ".join(f"{who} {n}" for who, n in votes.most_common() if who != ch["source_id"])
             drop_with_dependents(ch, ref, f"в отрывках это {ch['id']} {own} из {known} понятных"
                                  + (f" (ещё: {rivals})" if rivals else ""))

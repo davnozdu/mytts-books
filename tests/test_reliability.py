@@ -42,6 +42,18 @@ class CastTests(unittest.TestCase):
         answer = {"characters": [character("bakhmutov", ["c1"]), character("general", ["c2"])], "other": []}
         self.assertEqual([("general", "c2")], b.label_targets(r, answer, c))
 
+    def test_title_only_character_kept_when_passages_confirm(self):
+        self.c["c4"]["contexts"] = ["…"] * 5
+        a = dict(characters=[character("mama", ["c4"])], other=[])
+        result = b.build_cast(self.r, a, {}, self.c, "", {("mama", "c4"): collections.Counter({"mama": 5})})
+        self.assertEqual(["c4"], result["characters"][0]["candidates"])
+
+    def test_title_plan_follows_chapters(self):
+        whos = ["e", "e", "e", "i", "i", "i", "e", "i", "x"]
+        where = ["s1", "s1", "s1", "s2", "s2", "s2", "s3", "s4", "s4"]
+        plan, _ = b.title_plan(whos + ["e", "e"], where + ["s5", "s5"], ["s1", "s2", "s3", "s4", "s5"], {"e", "i"})
+        self.assertEqual({"s1": "e", "s2": "i", "s3": None, "s4": None, "s5": "e"}, plan)
+
     def test_unverified_merge_is_other(self):
         result = self.cast([character("n", ["c1", "c2"])])
         self.assertEqual(["c2"], result["characters"][0]["candidates"])
@@ -250,6 +262,24 @@ class ExtractorTests(unittest.TestCase):
         c = self.extract(text)
         self.assertEqual(5, c[(0, "владя")].count)
         self.assertEqual(4, c[(0, "кирюха")].count)
+
+    def test_remark_with_participle_and_apposition(self):
+        c = self.extract(["Пришла Катя. Ушла Катя.", "– Вот ходишь, – бормотала, улыбаясь, баба Катя."])
+        self.assertEqual(1, c[(0, "катя")].speaker)
+
+    def test_verb_with_noun_first_parse_is_recognised(self):
+        c = self.extract(["Пришёл Артем. Ушёл Артем.", "– А-а-а! – орал Артем, который испугался."])
+        self.assertEqual(1, c[(0, "артем")].speaker)
+
+    def test_sole_named_person_with_long_description(self):
+        c = self.extract(["Пришёл Виталик. Ушёл Виталик.",
+                          "– Не надо! – вдруг тоненько завопил, непонятно к кому обращаясь, вжавшийся в сиденье Виталик."])
+        self.assertEqual(1, c[(0, "виталик")].speaker)
+
+    def test_nickname_with_plural_only_parse_is_one_person(self):
+        c = self.extract(["– Живем, – обрадовался Санек.", "– Рожу видел! – не сдавался Санек."])
+        self.assertEqual("name", c[(0, "санек")].kind)
+        self.assertEqual(2, c[(0, "санек")].speaker)
 
     def test_two_surnames_in_a_row_are_two_people(self):
         c = self.extract(["Рогожин пришёл. Рогожин ушёл.", "— А ты ступай за мной, строка, — сказал Рогожин Лебедеву."])
