@@ -62,6 +62,10 @@ COLLECTION_CONCENTRATION = 0.75
 LABEL_SAMPLES = 16
 # Обращение в романе: отрывков из каждой главы (решение по главе) и сколько отрывков в одном запросе.
 LABEL_PER_CHAPTER = 3
+LABEL_PER_BUSY_CHAPTER = 5
+# Порог главы, когда основной разбор уже отдал обращение этому человеку и ни один отрывок главы не называет
+# другого персонажа: два независимых признака согласны.
+AGREED_DOMINANCE = 0.6
 LABEL_BATCH = 40
 LABEL_THINK = False
 # Решение по одной главе: не меньше стольких понятных ответов.
@@ -928,7 +932,9 @@ def label_contexts(book: Book, c: Candidate, per_chapter: bool = False) -> dict:
         by_section = collections.defaultdict(list)
         for spot in c.spots:
             by_section[book.paragraphs[spot[0]][0]].append(spot)
-        chosen = [spot for spots in by_section.values() for spot in spread(spots, LABEL_PER_CHAPTER)]
+        # Где обращение частое, отрывков больше: один неуверенный ответ не должен решать главу.
+        chosen = [spot for spots in by_section.values()
+                  for spot in spread(spots, LABEL_PER_BUSY_CHAPTER if len(spots) >= 10 else LABEL_PER_CHAPTER)]
     else:
         chosen = spread(c.spots, LABEL_SAMPLES)
     out, where = [], []
@@ -1870,6 +1876,9 @@ def title_plan(whos: list, where: list, sections: list, people: set, hint: str =
             continue
         lead = top(votes)
         keep, own, known = label_decision(votes, lead, MIN_CHAPTER_ANSWERS) if lead else (False, 0, 0)
+        rivals = sum(n for who, n in votes.items() if who in people and who != lead)
+        if not keep and lead and lead == hint and not rivals and known >= MIN_CHAPTER_ANSWERS and own >= AGREED_DOMINANCE * known:
+            keep = True  # «чиновник» в 1-й главе: основной разбор — Лебедев, отрывки — Лебедев 2, «не знаю» 1
         state[sid] = ("sure", lead) if keep else ("few", None) if known < MIN_CHAPTER_ANSWERS else ("split", None)
     sure = [(i, state[sid][1]) for i, sid in enumerate(sections) if state[sid][0] == "sure"]
     plan = {}

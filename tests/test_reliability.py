@@ -54,6 +54,14 @@ class CastTests(unittest.TestCase):
         plan, _ = b.title_plan(whos + ["e", "e"], where + ["s5", "s5"], ["s1", "s2", "s3", "s4", "s5"], {"e", "i"})
         self.assertEqual({"s1": "e", "s2": "i", "s3": None, "s4": None, "s5": "e"}, plan)
 
+    def test_chapter_agreeing_with_main_answer_needs_less(self):
+        plan, _ = b.title_plan(["e", "e", "other"], ["s1"] * 3, ["s1"], {"e", "i"}, hint="e")
+        self.assertEqual({"s1": "e"}, plan)
+        plan, _ = b.title_plan(["e", "e", "i"], ["s1"] * 3, ["s1"], {"e", "i"}, hint="e")
+        self.assertEqual({"s1": None}, plan)  # другой названный персонаж — строгий порог
+        plan, _ = b.title_plan(["e", "e", "other"], ["s1"] * 3, ["s1"], {"e", "i"})
+        self.assertEqual({"s1": None}, plan)  # без основного разбора — строгий порог
+
     def test_unverified_merge_is_other(self):
         result = self.cast([character("n", ["c1", "c2"])])
         self.assertEqual(["c2"], result["characters"][0]["candidates"])
