@@ -762,6 +762,27 @@ class CollectionTests(unittest.TestCase):
         self.assertFalse(b.detect_collection(book, b.Extractor().run(book, False)))
 
 
+class StoriesTests(unittest.TestCase):
+    XML = ('<?xml version="1.0" encoding="utf-8"?><FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
+           '<description><title-info><book-title>С</book-title></title-info></description><body>'
+           '<section><title><p>Люди</p></title>'
+           '<section><title><p>Первый</p></title><p>Пришла Зина. Ушла Зина. Видела Зину. Пришла Зина. Ушла Зина.</p>'
+           '<p>Пришёл Павел. Ушёл Павел. Видел Павла. Пришёл Павел. Ушёл Павел.</p></section>'
+           '<section><title><p>Второй</p></title><p>Пришла Ванда. Ушла Ванда. Видела Ванду. Пришла Ванда. Ушла Ванда.</p>'
+           '<p>Пришёл Олег. Ушёл Олег. Видел Олега. Пришёл Олег. Ушёл Олег.</p></section></section>'
+           '<section><title><p>Звери</p></title>'
+           '<section><title><p>Глава 1</p></title><p>Пришла Лида. Ушла Лида. Пришёл Семен. Ушёл Семен. Видел Семена.</p></section>'
+           '<section><title><p>Глава 2</p></title><p>Видела Лиду. Пришла Лида. Ушла Лида. Пришёл Семен. Видел Семена.</p></section>'
+           '</section></body></FictionBook>')
+
+    def test_parts_split_into_stories_but_story_chapters_stay_together(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "s.fb2")
+            Path(path).write_text(self.XML, encoding="utf-8")
+            book = b.stories(path, b.read_book(path))
+            self.assertEqual(["Люди Первый", "Люди Второй", "Звери"], [s["title"] for s in book.sections])
+
+
 class ExportTests(unittest.TestCase):
     def test_rejected_title_does_not_erase_protagonist_voice_priority(self):
         with tempfile.TemporaryDirectory() as folder:

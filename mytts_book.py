@@ -89,7 +89,7 @@ class Book:
     analysis: dict = field(default_factory=dict)  # номер абзаца → текст без значков сносок («Рогожин¹»)
 
 
-def read_epub(path: str, nested: bool = False) -> Book:
+def read_epub(path: str, nested: bool | int = False) -> Book:
     """Абзацы в порядке чтения. Разделы — верхний уровень оглавления (в сборнике вложенные пункты — части
     рассказа); nested — все пункты оглавления, то есть главы романа («ЧАСТЬ ПЕРВАЯ. I.»)."""
     with zipfile.ZipFile(path) as z:
@@ -186,6 +186,40 @@ HEADING = re.compile(r"^(?:(?:глава|часть|книга|chapter|part)\s+(
                      r"[ivxlcdm]{1,7}|[0-9]{1,3})\.?$", re.IGNORECASE)
 
 
+def stories(path: str, book: Book) -> Book:
+    """Рассказы сборника. Оглавление бывает смешанным: часть «Люди» делится на рассказы, а рассказ «Эррата»
+    — на главы. Раздел делится на подразделы следующего уровня, только если у каждого подраздела свои герои
+    (как у рассказов сборника); если одни и те же герои проходят через подразделы — это главы одного рассказа."""
+    for depth in range(2, 6):
+        deeper = read_book(path, nested=depth)
+        if len(deeper.paragraphs) != len(book.paragraphs) or len(deeper.sections) <= len(book.sections):
+            break
+        found = Extractor().run(normalized(deeper), per_section=False)
+        named = [c for c in found.values() if c.kind == "name"]
+        children: dict[int, set] = collections.defaultdict(set)
+        for (unit, _), (child, _) in zip(book.paragraphs, deeper.paragraphs):
+            children[unit].add(child)
+        split = {}
+        for unit, kids in children.items():
+            heroes = sorted(((sum(c.sections[k] for k in kids), c) for c in named), key=lambda x: -x[0])[:10]
+            heroes = [(n, c) for n, c in heroes if n >= 5]
+            total = sum(n for n, _ in heroes)
+            home = sum(max(c.sections[k] for k in kids) for _, c in heroes)
+            split[unit] = len(kids) > 1 and len(heroes) >= 2 and home >= COLLECTION_CONCENTRATION * total
+        if not any(split.values()):
+            break
+        keys, sections, paragraphs = {}, [], []
+        for (unit, text), (child, _) in zip(book.paragraphs, deeper.paragraphs):
+            key = ("child", child) if split[unit] else ("unit", unit)
+            if key not in keys:
+                keys[key] = len(sections)
+                title = deeper.sections[child]["title"] if split[unit] else book.sections[unit]["title"]
+                sections.append({"id": f"s{len(sections) + 1}", "title": title})
+            paragraphs.append((keys[key], text))
+        book = Book(book.title, book.author, sections, paragraphs, book.notes, book.analysis)
+    return book
+
+
 def chapters(path: str) -> Book:
     """Главы романа для решений по главам: пункты оглавления всех уровней; если их нет или он один —
     заголовки в тексте («Глава 5», «XII.», «12.» отдельной строкой); иначе книга как есть.
@@ -230,7 +264,7 @@ def merge_tiny_sections(book: Book, smallest: int = 3) -> Book:
     return Book(book.title, book.author, sections, [(renumber[target[s]], t) for s, t in book.paragraphs], book.notes, book.analysis)
 
 
-def read_book(path: str, nested: bool = False) -> Book:
+def read_book(path: str, nested: bool | int = False) -> Book:
     """EPUB или FB2 (в том числе .fb2.zip). nested — разделы по главам (все уровни оглавления)."""
     low = path.lower()
     if low.endswith((".fb2", ".fb2.zip")):
@@ -242,7 +276,7 @@ def read_book(path: str, nested: bool = False) -> Book:
     return read_epub(path, nested)
 
 
-def read_fb2(path: str, nested: bool = False) -> Book:
+def read_fb2(path: str, nested: bool | int = False) -> Book:
     """FB2: разделы — секции верхнего уровня основного <body> (как верхний уровень оглавления EPUB; nested —
     вложенные секции, то есть главы),
     абзацы — <p>, строки стихов <v>, подзаголовки и подписи; сноски (<body name="notes">) не читаются."""
@@ -269,6 +303,7 @@ def read_fb2(path: str, nested: bool = False) -> Book:
         if first is not None:
             author = " ".join(text(e) for e in first if local(e) in ("first-name", "middle-name", "last-name") and text(e))
     bodies = [e for e in root if local(e) == "body" and e.get("name") not in ("notes", "comments", "footnotes")]
+    depth = 99 if nested is True else int(nested) if nested else 1
     sections: list = []
     paragraphs: list[tuple[int, str]] = []
     leaf = {"p", "v", "subtitle", "text-author"}
@@ -286,7 +321,7 @@ def read_fb2(path: str, nested: bool = False) -> Book:
                 paragraphs.append((section, line))
             return
         for child in e:
-            if nested and local(child) == "section":
+            if local(child) == "section" and len(path) < depth:
                 inner, inner_path = open_section(child, path)
                 walk(child, inner, inner_path)
                 # текст родительской секции после вложенной (редко) — снова к родителю
@@ -308,9 +343,10 @@ def read_fb2(path: str, nested: bool = False) -> Book:
     return Book(clean(title), clean(author), sections, [(renumber[s], t) for s, t in paragraphs])
 
 
-def toc_entries(z, base, items, opf, nested: bool = False) -> list[tuple[str, str]]:
+def toc_entries(z, base, items, opf, nested: bool | int = False) -> list[tuple[str, str]]:
     """Пункты оглавления (название, ссылка) по порядку. nested — с вложенными, название с путём:
     «ЧАСТЬ ПЕРВАЯ. I.»; иначе только верхний уровень."""
+    depth = 99 if nested is True else int(nested) if nested else 1  # число уровней оглавления
     nav = next((e for e in items.values() if "nav" in (e.get("properties") or "").split()), None)
     if nav is not None:
         soup = BeautifulSoup(z.read(str(base / nav.get("href"))).decode("utf-8", "replace"), "html.parser")
@@ -325,7 +361,7 @@ def toc_entries(z, base, items, opf, nested: bool = False) -> list[tuple[str, st
                 if a and a.get("href"):
                     out.append((" ".join(path + [label]), resolve(nav.get("href"), a.get("href"))))
                 child = li.find("ol")
-                if nested and child:
+                if len(path) + 1 < depth and child:
                     walk_nav(child, path + [label] if label else path)
         if ol:
             walk_nav(ol, [])
@@ -349,7 +385,7 @@ def toc_entries(z, base, items, opf, nested: bool = False) -> list[tuple[str, st
             content = next((e for e in point if e.tag.endswith("}content")), None)
             if content is not None:
                 out.append((" ".join(path + [label]), resolve(ncx.get("href"), content.get("src"))))
-            if nested:
+            if len(path) + 1 < depth:
                 walk_ncx(point, path + [label] if label else path)
     if nav_map is not None:
         walk_ncx(nav_map, [])
@@ -1109,6 +1145,8 @@ def extract(args) -> None:
     found = extractor.run(text, per_section=False)
     collection = args.scope == "section" or (args.scope == "auto" and detect_collection(book, found))
     if collection:
+        book = stories(args.book, book)
+        text = normalized(book)
         found = Extractor().run(text, per_section=True)
     else:
         # Роман — по главам: обращение («генерал») решается для каждой главы, где оно однозначно.
