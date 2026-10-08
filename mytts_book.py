@@ -55,6 +55,12 @@ CASE_ENDINGS = ("ами", "ями", "ому", "ему", "ыми", "ими", "о�
                 "а", "у", "е", "ы", "и", "ю", "я")
 # Сколько отрывков по всей книге проверяет LLM для обращения или голой фамилии.
 LABEL_SAMPLES = 16
+# Обращение в романе: отрывков из каждой главы (решение по главе) и сколько отрывков в одном запросе.
+LABEL_PER_CHAPTER = 3
+LABEL_BATCH = 40
+LABEL_THINK = False
+# Решение по одной главе: не меньше стольких понятных ответов.
+MIN_CHAPTER_ANSWERS = 2
 # Меньше понятных ответов по отрывкам — решения по обращению нет (оно в «прочих»).
 MIN_LABEL_ANSWERS = 3
 SINGLE_SURNAME = re.compile(r"^[а-яё-]{3,}(?:ов|ев|ёв|ин|ын)$")
@@ -72,8 +78,9 @@ class Book:
     paragraphs: list          # [(номер раздела, текст)]
 
 
-def read_epub(path: str) -> Book:
-    """Абзацы в порядке чтения, разделы — верхний уровень оглавления (вложенные пункты — части рассказа)."""
+def read_epub(path: str, nested: bool = False) -> Book:
+    """Абзацы в порядке чтения. Разделы — верхний уровень оглавления (в сборнике вложенные пункты — части
+    рассказа); nested — все пункты оглавления, то есть главы романа («ЧАСТЬ ПЕРВАЯ. I.»)."""
     with zipfile.ZipFile(path) as z:
         container = ET.fromstring(z.read("META-INF/container.xml"))
         opf_path = next(e.get("full-path") for e in container.iter() if e.tag.endswith("rootfile"))
@@ -83,7 +90,7 @@ def read_epub(path: str) -> Book:
         author = next((e.text for e in opf.iter() if e.tag.endswith("}creator") and e.text), "")
         items = {e.get("id"): e for e in opf.iter() if e.tag.endswith("}item")}
         spine = [items[e.get("idref")].get("href") for e in opf.iter() if e.tag.endswith("}itemref") and e.get("idref") in items]
-        toc = top_level_toc(z, base, items, opf)
+        toc = toc_entries(z, base, items, opf, nested)
         # Пункт оглавления: файл → [(якорь или None, номер раздела)]
         starts: dict[str, list] = collections.defaultdict(list)
         sections = []
@@ -117,20 +124,69 @@ def read_epub(path: str) -> Book:
     return Book(title, clean(author), sections, [(renumber[s], t) for s, t in paragraphs])
 
 
-def read_book(path: str) -> Book:
-    """EPUB или FB2 (в том числе .fb2.zip)."""
+HEADING = re.compile(r"^(?:(?:глава|часть|книга|chapter|part)\s+(?:[0-9]{1,3}|[ivxlcdm]{1,7}|[а-яё-]{3,20})|"
+                     r"[ivxlcdm]{1,7}|[0-9]{1,3})\.?$", re.IGNORECASE)
+
+
+def chapters(path: str) -> Book:
+    """Главы романа для решений по главам: пункты оглавления всех уровней; если их нет или он один —
+    заголовки в тексте («Глава 5», «XII.», «12.» отдельной строкой); иначе книга как есть.
+    Граница главы всегда совпадает с началом абзаца-заголовка или пункта оглавления — книга не режется
+    механически по объёму."""
+    book = read_book(path, nested=True)
+    if len(book.sections) >= 3:
+        return merge_tiny_sections(book)
+    marks = [i for i, (_, t) in enumerate(book.paragraphs) if len(t) <= 40 and HEADING.match(t.strip())]
+    gaps = [b - a for a, b in zip(marks, marks[1:])]
+    if len(marks) < 3 or sorted(gaps)[len(gaps) // 2] < 10:
+        return book  # нет ясных заголовков (или это нумерованный список) — не делим
+    sections, paragraphs, current = [], [], -1
+    starts = set(marks)
+    previous_section = None
+    for i, (old, text) in enumerate(book.paragraphs):
+        if i in starts or old != previous_section or current < 0:
+            title = text if i in starts else book.sections[old]["title"]
+            sections.append({"id": f"s{len(sections) + 1}", "title": title})
+            current = len(sections) - 1
+        previous_section = old
+        paragraphs.append((current, text))
+    return merge_tiny_sections(Book(book.title, book.author, sections, paragraphs))
+
+
+def merge_tiny_sections(book: Book, smallest: int = 3) -> Book:
+    """Раздел из одного-двух абзацев («ЧАСТЬ ПЕРВАЯ.», титул) — к следующему: главы — это текст, а не заголовки."""
+    size = collections.Counter(s for s, _ in book.paragraphs)
+    order = sorted(size)
+    target, carry = {}, []
+    for s in order:
+        carry.append(s)
+        if size[s] >= smallest:
+            for x in carry:
+                target[x] = s
+            carry = []
+    for x in carry:  # хвост из мелких — к последнему настоящему
+        target[x] = max(target.values(), default=x)
+    used = sorted(set(target.values()))
+    renumber = {old: new for new, old in enumerate(used)}
+    sections = [dict(book.sections[old], id=f"s{renumber[old] + 1}") for old in used]
+    return Book(book.title, book.author, sections, [(renumber[target[s]], t) for s, t in book.paragraphs])
+
+
+def read_book(path: str, nested: bool = False) -> Book:
+    """EPUB или FB2 (в том числе .fb2.zip). nested — разделы по главам (все уровни оглавления)."""
     low = path.lower()
     if low.endswith((".fb2", ".fb2.zip")):
-        return read_fb2(path)
+        return read_fb2(path, nested)
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
             if "META-INF/container.xml" not in z.namelist() and any(n.lower().endswith(".fb2") for n in z.namelist()):
-                return read_fb2(path)
-    return read_epub(path)
+                return read_fb2(path, nested)
+    return read_epub(path, nested)
 
 
-def read_fb2(path: str) -> Book:
-    """FB2: разделы — секции верхнего уровня основного <body> (как верхний уровень оглавления EPUB),
+def read_fb2(path: str, nested: bool = False) -> Book:
+    """FB2: разделы — секции верхнего уровня основного <body> (как верхний уровень оглавления EPUB; nested —
+    вложенные секции, то есть главы),
     абзацы — <p>, строки стихов <v>, подзаголовки и подписи; сноски (<body name="notes">) не читаются."""
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
@@ -159,23 +215,33 @@ def read_fb2(path: str) -> Book:
     paragraphs: list[tuple[int, str]] = []
     leaf = {"p", "v", "subtitle", "text-author"}
 
-    def walk(e, section: int) -> None:
+    def open_section(e, path) -> tuple[int, list]:
+        heading = next((text(t) for t in e if local(t) == "title"), "")
+        label = " ".join(path + [heading]) if heading else (" ".join(path) or f"Раздел {len(sections) + 1}")
+        sections.append({"id": f"s{len(sections) + 1}", "title": label})
+        return len(sections) - 1, path + [heading] if heading else path
+
+    def walk(e, section: int, path: list) -> None:
         if local(e) in leaf:
             line = text(e)
             if line:
                 paragraphs.append((section, line))
             return
         for child in e:
-            walk(child, section)
+            if nested and local(child) == "section":
+                inner, inner_path = open_section(child, path)
+                walk(child, inner, inner_path)
+                # текст родительской секции после вложенной (редко) — снова к родителю
+            else:
+                walk(child, section, path)
 
     for body in bodies:
         for child in body:
             if local(child) == "section":
-                heading = next((text(t) for t in child if local(t) == "title"), "")
-                sections.append({"id": f"s{len(sections) + 1}", "title": heading or f"Раздел {len(sections) + 1}"})
-                walk(child, len(sections) - 1)
+                index, path = open_section(child, [])
+                walk(child, index, path)
             else:  # заголовок книги, эпиграф перед первой секцией
-                walk(child, max(0, len(sections) - 1))
+                walk(child, max(0, len(sections) - 1), [])
     if not sections:
         sections = [{"id": "s1", "title": title}]
     used = sorted({s for s, _ in paragraphs})
@@ -184,18 +250,27 @@ def read_fb2(path: str) -> Book:
     return Book(clean(title), clean(author), sections, [(renumber[s], t) for s, t in paragraphs])
 
 
-def top_level_toc(z, base, items, opf) -> list[tuple[str, str]]:
+def toc_entries(z, base, items, opf, nested: bool = False) -> list[tuple[str, str]]:
+    """Пункты оглавления (название, ссылка) по порядку. nested — с вложенными, название с путём:
+    «ЧАСТЬ ПЕРВАЯ. I.»; иначе только верхний уровень."""
     nav = next((e for e in items.values() if "nav" in (e.get("properties") or "").split()), None)
     if nav is not None:
         soup = BeautifulSoup(z.read(str(base / nav.get("href"))).decode("utf-8", "replace"), "html.parser")
         toc = soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav")
         ol = toc.find("ol") if toc else None
-        if ol:
-            out = []
+        out: list[tuple[str, str]] = []
+
+        def walk_nav(ol, path):
             for li in ol.find_all("li", recursive=False):
                 a = li.find("a")
+                label = clean(a.get_text(" ")) if a else ""
                 if a and a.get("href"):
-                    out.append((clean(a.get_text(" ")), resolve(nav.get("href"), a.get("href"))))
+                    out.append((" ".join(path + [label]), resolve(nav.get("href"), a.get("href"))))
+                child = li.find("ol")
+                if nested and child:
+                    walk_nav(child, path + [label] if label else path)
+        if ol:
+            walk_nav(ol, [])
             if out:
                 return out
     spine = next((e for e in opf.iter() if e.tag.endswith("}spine")), None)
@@ -206,13 +281,20 @@ def top_level_toc(z, base, items, opf) -> list[tuple[str, str]]:
     root = ET.fromstring(z.read(str(base / ncx.get("href"))))
     nav_map = next((e for e in root.iter() if e.tag.endswith("}navMap")), None)
     out = []
-    for point in (nav_map if nav_map is not None else []):
-        if not point.tag.endswith("}navPoint"):
-            continue
-        label = next((e.text for e in point.iter() if e.tag.endswith("}text") and e.text), "")
-        content = next((e for e in point if e.tag.endswith("}content")), None)
-        if content is not None:
-            out.append((clean(label), resolve(ncx.get("href"), content.get("src"))))
+
+    def walk_ncx(parent, path):
+        for point in parent:
+            if not point.tag.endswith("}navPoint"):
+                continue
+            label_e = next((e for e in point if e.tag.endswith("}navLabel")), None)
+            label = clean(next((e.text for e in label_e.iter() if e.tag.endswith("}text") and e.text), "")) if label_e is not None else ""
+            content = next((e for e in point if e.tag.endswith("}content")), None)
+            if content is not None:
+                out.append((" ".join(path + [label]), resolve(ncx.get("href"), content.get("src"))))
+            if nested:
+                walk_ncx(point, path + [label] if label else path)
+    if nav_map is not None:
+        walk_ncx(nav_map, [])
     return out
 
 
@@ -284,6 +366,7 @@ class Candidate:
     examples: list = field(default_factory=list)
     spots: list = field(default_factory=list)   # (абзац, начало, конец) каждого упоминания
     descriptor: bool = False      # «черномазый», «камердинер»: так назван говорящий в ремарке
+    speaker_sections: collections.Counter = field(default_factory=collections.Counter)  # реплики по разделам
     together: collections.Counter = field(default_factory=collections.Counter)
 
 
@@ -604,7 +687,9 @@ class Extractor:
                 cand.descriptor = True
                 cand.forms[text[start:end]] += 1
                 cand.speaker += 1
+                cand.speaker_sections[section] += 1
                 cand.genders["verb:" + ("f" if gender == "femn" else "m")] += 1
+            self.section = section
             self.attribute_speakers(text, mentions, describe)
             present = {id(x.cand): x.cand for x in mentions}
             for a in present.values():
@@ -656,6 +741,7 @@ class Extractor:
             *_, mention, verb = min(pairs, key=lambda pair: pair[:2])
             speaker = mention.cand
             speaker.speaker += 1
+            speaker.speaker_sections[getattr(self, "section", 0)] += 1
             if verb.tag.gender in ("masc", "femn"):
                 speaker.genders["verb:" + ("f" if verb.tag.gender == "femn" else "m")] += 1
 
@@ -698,14 +784,18 @@ def needs_contexts(c: Candidate) -> bool:
     return c.kind == "title" or (c.kind == "name" and " " not in c.key and bool(c.roles.get("Surn")))
 
 
-def label_contexts(book: Book, c: Candidate, limit: int) -> list[str]:
-    """Равномерно по книге: предыдущий абзац (того же раздела) и абзац с упоминанием, слово в [[…]]."""
-    if len(c.spots) <= limit:
-        chosen = c.spots
+def label_contexts(book: Book, c: Candidate, per_chapter: bool = False) -> dict:
+    """Отрывки для «кто это»: предыдущий абзац (того же раздела) и абзац с упоминанием, слово в [[…]].
+    Равномерно по книге (LABEL_SAMPLES) или, для обращения в романе, до LABEL_PER_CHAPTER из каждой главы,
+    где оно встречается: тогда решение принимается и для каждой главы отдельно."""
+    if per_chapter:
+        by_section = collections.defaultdict(list)
+        for spot in c.spots:
+            by_section[book.paragraphs[spot[0]][0]].append(spot)
+        chosen = [spot for spots in by_section.values() for spot in spread(spots, LABEL_PER_CHAPTER)]
     else:
-        step = len(c.spots) / limit
-        chosen = [c.spots[int(i * step + step / 2)] for i in range(limit)]
-    out = []
+        chosen = spread(c.spots, LABEL_SAMPLES)
+    out, where = [], []
     for paragraph, start, end in chosen:
         section, text = book.paragraphs[paragraph]
         left = max(0, start - 320)
@@ -715,7 +805,15 @@ def label_contexts(book: Book, c: Candidate, limit: int) -> list[str]:
             before = ("…" if len(previous) > 220 else "") + previous[-220:] + "\n" + before
         right = min(len(text), end + 160)
         out.append(before + "[[" + text[start:end] + "]]" + text[end:right] + ("…" if right < len(text) else ""))
-    return out
+        where.append(book.sections[section]["id"])
+    return {"contexts": out, "context_sections": where}
+
+
+def spread(items: list, limit: int) -> list:
+    if len(items) <= limit:
+        return list(items)
+    step = len(items) / limit
+    return [items[int(i * step + step / 2)] for i in range(limit)]
 
 
 def gender_source(c: Candidate) -> tuple[str, str | None]:
@@ -863,6 +961,12 @@ def extract(args) -> None:
     collection = args.scope == "section" or (args.scope == "auto" and detect_collection(book, found))
     if collection:
         found = Extractor().run(book, per_section=True)
+    else:
+        # Роман — по главам: обращение («генерал») решается для каждой главы, где оно однозначно.
+        chaptered = chapters(args.book)
+        if len(chaptered.sections) > len(book.sections):
+            book = chaptered
+            found = Extractor().run(book, per_section=False)
     groups: dict[int, list] = collections.defaultdict(list)
     for c in found.values():
         if c.descriptor and c.speaker < 2 and not c.titles:
@@ -883,11 +987,15 @@ def extract(args) -> None:
                 "gender_source": gender_source(c)[1],
                 "roles": dict(c.roles), "titles": dict(c.titles), "forms": dict(c.forms.most_common()),
                 "sections": [book.sections[s]["id"] for s in sorted(c.sections)],
+                # По разделам: в романе по главам обращение может принадлежать разным людям — их реплики и
+                # упоминания считаются только там, где обращение за ними.
+                "section_counts": {book.sections[s]["id"]: n for s, n in sorted(c.sections.items())},
+                "speaker_sections": {book.sections[s]["id"]: n for s, n in sorted(c.speaker_sections.items())},
                 "together": [ids[(scope, k)] for k, _ in c.together.most_common(8) if (scope, k) in ids],
                 # Сколько абзацев с каждым кандидатом: голос делят только те, кто почти не встречается.
                 "together_counts": {ids[(scope, k)]: n for k, n in c.together.most_common() if (scope, k) in ids},
                 "examples": c.examples,
-                **({"contexts": label_contexts(book, c, LABEL_SAMPLES)} if needs_contexts(c) else {}),
+                **(label_contexts(book, c, per_chapter=not collection and c.kind == "title") if needs_contexts(c) else {}),
             })
         if not ranked:
             continue
@@ -1117,21 +1225,23 @@ def llm(args) -> None:
 
     input_sha = artifact_identity(args.dir)
 
-    def identity(prompt: str) -> str:
-        return cache_fingerprint(args.provider, args.endpoint, args.model, args.think, prompt,
-                                 args.max_tokens or MAX_TOKENS[args.provider]["think" if args.think else "plain"], input_sha)
+    def identity(prompt: str, think: bool | None = None) -> str:
+        think = args.think if think is None else think
+        return cache_fingerprint(args.provider, args.endpoint, args.model, think, prompt,
+                                 args.max_tokens or MAX_TOKENS[args.provider]["think" if think else "plain"], input_sha)
 
-    def cached(prompt: str, name: str, verify: bool = False, check=None) -> bool:
+    def cached(prompt: str, name: str, verify: bool = False, check=None, think: bool | None = None) -> bool:
         if args.redo:
             return False
         answer = load_answer(os.path.join(folder, name + ".json"))
         meta = load_answer(os.path.join(folder, name + ".meta.json"))
         good = check(answer) if check else valid_response(answer, verify)
-        return bool(good and meta and meta.get("request_sha256") == identity(prompt)
+        return bool(good and meta and meta.get("request_sha256") == identity(prompt, think)
                     and meta.get("done_reason") != "length")
 
-    def chat(prompt: str, name: str, verify: bool = False, check=None) -> str:
-        requested_limit = args.max_tokens or MAX_TOKENS[args.provider]["think" if args.think else "plain"]
+    def chat(prompt: str, name: str, verify: bool = False, check=None, think: bool | None = None) -> str:
+        think = args.think if think is None else think
+        requested_limit = args.max_tokens or MAX_TOKENS[args.provider]["think" if think else "plain"]
         model_key = (args.provider, args.endpoint, args.model)
         limit = min(requested_limit, _MODEL_LIMITS.get(model_key, requested_limit))
         delay = 2.0
@@ -1139,7 +1249,7 @@ def llm(args) -> None:
         for attempt in range(1, 4):
             started = time.time()
             try:
-                reply = request_chat(args.provider, args.endpoint, args.model, key, prompt, args.think, limit, args.timeout,
+                reply = request_chat(args.provider, args.endpoint, args.model, key, prompt, think, limit, args.timeout,
                                      **({"effort": effort} if effort else {}))
             except LLMError as e:
                 if attempt < 3 and e.status == 400 and e.max_output_tokens and 0 < e.max_output_tokens < limit:
@@ -1175,7 +1285,7 @@ def llm(args) -> None:
                 with open(os.path.join(folder, f"{name}.failed{attempt}.txt"), "w", encoding="utf-8") as f:
                     f.write(content)
                 if attempt < 3:
-                    if reply.get("done_reason") == "length" and args.think:
+                    if reply.get("done_reason") == "length" and think:
                         # Размышление не уложилось в предел ответа: следующая попытка — ступенью короче, но с размышлением.
                         current = effort or reply.get("thinking_control") or "high"
                         effort = EFFORTS[min(len(EFFORTS) - 1, EFFORTS.index(current) + 1)] if current in EFFORTS else "medium"
@@ -1185,7 +1295,7 @@ def llm(args) -> None:
                     continue
                 raise ValueError(f"LLM не вернула полный JSON нужного формата: {why}; ответ не сохранён")
             meta = dict(reply, provider=args.provider, model=args.model, content_chars=len(content), effort=effort,
-                        request_sha256=identity(prompt), thinking=args.think, endpoint=args.endpoint, max_tokens=requested_limit, effective_max_tokens=limit, input_sha256=input_sha,
+                        request_sha256=identity(prompt, think), thinking=think, endpoint=args.endpoint, max_tokens=requested_limit, effective_max_tokens=limit, input_sha256=input_sha,
                         seconds=round(time.time() - started, 1), attempt=attempt)
             # Never expose a partly written reply as a completed cache entry.
             save(folder, name + ".json", answer)
@@ -1239,12 +1349,11 @@ def llm(args) -> None:
             return ""
         done = 0
         for _, ref in label_targets(r, answer, by_id):
-            prompt = label_prompt(r, answer, by_id, ref, request["scope"] == "section")
-            count = len(by_id[ref]["contexts"])
-            check = lambda a, count=count: label_votes(a, count) is not None
-            label = f"{name}.label.{ref}"
-            if not cached(prompt, label, check=check):
-                chat(prompt, label, check=check)
+            for suffix, prompt, lo, hi in label_requests(r, answer, by_id, ref, request["scope"] == "section"):
+                check = lambda a, count=hi - lo: label_votes(a, count) is not None
+                # «Кто это в отрывке» — выбор из списка: без размышления быстрее и не зацикливается.
+                if not cached(prompt, name + suffix, check=check, think=LABEL_THINK):
+                    chat(prompt, name + suffix, check=check, think=LABEL_THINK)
             done += 1
         return f"; обращений и фамилий проверено по отрывкам: {done}" if done else ""
 
@@ -1366,10 +1475,40 @@ def label_targets(r: dict, answer: dict, by_id: dict) -> list[tuple[str, str]]:
                     for x in r["candidates"] if x != ref):
                 continue  # единственное имя персонажа и других носителей фамилии нет: путать не с кем
             out.append((str(raw.get("id", "")), ref))
+    # Обращение, которое LLM оставила в «прочих» («генерал» — то один, то другой): в отдельных главах
+    # оно может быть однозначным — его тоже проверяем по отрывкам.
+    other = answer.get("other", [])
+    for ref in dict.fromkeys(other if isinstance(other, list) else []):
+        c = by_id.get(ref) if isinstance(ref, str) and ref in r["candidates"] else None
+        if c and c["kind"] == "title" and len(c.get("contexts") or []) >= MIN_LABEL_ANSWERS \
+                and (c["speaker"] >= 2 or c["count"] >= 10):
+            out.append(("", ref))
     return out
 
 
-def label_prompt(r: dict, answer: dict, by_id: dict, ref: str, collection: bool) -> str:
+def label_requests(r: dict, answer: dict, by_id: dict, ref: str, collection: bool) -> list[tuple[str, str, int, int]]:
+    """(суффикс имени файла, запрос, начало, конец) — отрывки порциями по LABEL_BATCH."""
+    total = len(by_id[ref]["contexts"])
+    parts = [(lo, min(total, lo + LABEL_BATCH)) for lo in range(0, total, LABEL_BATCH)]
+    return [(f".label.{ref}" if len(parts) == 1 else f".label.{ref}.{n}", label_prompt(r, answer, by_id, ref, collection, lo, hi), lo, hi)
+            for n, (lo, hi) in enumerate(parts, 1)]
+
+
+def label_whos(folder: str, name: str, r: dict, answer: dict, by_id: dict, ref: str, collection: bool, meta_ok) -> list | None:
+    """Ответ «кто это» для каждого отрывка по порядку; None — какой-то порции нет или она устарела."""
+    whos = []
+    for suffix, prompt, lo, hi in label_requests(r, answer, by_id, ref, collection):
+        path = os.path.join(folder, name + suffix)
+        if not meta_ok(load_answer(path + ".meta.json"), prompt):
+            return None
+        checked = load_answer(path + ".json")
+        if label_votes(checked, hi - lo) is None:
+            return None
+        whos += [a["who"] for a in sorted(checked["answers"], key=lambda a: a["n"])]
+    return whos
+
+
+def label_prompt(r: dict, answer: dict, by_id: dict, ref: str, collection: bool, lo: int = 0, hi: int | None = None) -> str:
     people = []
     for raw in answer.get("characters", []):
         if not isinstance(raw, dict):
@@ -1380,7 +1519,7 @@ def label_prompt(r: dict, answer: dict, by_id: dict, ref: str, collection: bool)
                 forms.update(by_id[x]["forms"])
         names = ", ".join(f for f, _ in forms.most_common(6))
         people.append(f"- {raw.get('id', '')}: {raw.get('name', '')}" + (f" ({names})" if names else ""))
-    snippets = "\n".join(f"{n}. {text}" for n, text in enumerate(by_id[ref]["contexts"], 1))
+    snippets = "\n".join(f"{n}. {text}" for n, text in enumerate(by_id[ref]["contexts"][lo:hi], 1))
     what = f"рассказа «{r['title']}»" if collection else f"книги «{r['title']}»"
     return LABELS.format(what=what, people="\n".join(people), label=by_id[ref]["display"], snippets=snippets)
 
@@ -1560,12 +1699,52 @@ DOMINANCE = 0.8
 PATRONYMIC_SHORT = ((r"ович$", "ыч"), (r"евич$", "ич"))
 
 
-def label_decision(votes: collections.Counter, owner: str) -> tuple[bool, int, int]:
+def label_decision(votes: collections.Counter, owner: str, minimum: int = MIN_LABEL_ANSWERS) -> tuple[bool, int, int]:
     """(оставить ли, в пользу owner, понятных ответов) по ответам «кто это» в отрывках."""
     known = sum(n for who, n in votes.items() if who != "unsure")
     own = votes.get(owner, 0)
-    enough = known >= max(MIN_LABEL_ANSWERS, sum(votes.values()) / 2)
+    enough = known >= max(minimum, sum(votes.values()) / 2)
     return enough and own >= DOMINANCE * known, own, known
+
+
+def title_plan(whos: list, where: list, sections: list, people: set, hint: str = "") -> tuple[dict, dict]:
+    """Чьё обращение в каждой главе. Генерал может «кочевать»: в одних главах это Епанчин, в других Иволгин.
+    Глава с уверенным большинством ответов — за этим человеком; с разногласием — «прочие»; с одним-двумя
+    упоминаниями — как соседние главы до и после, если они решены одинаково, иначе как вся книга.
+    Возвращает ({глава: id или None}, сведения для отчёта)."""
+    def top(votes):
+        named = [(n, who) for who, n in votes.items() if who in people]
+        return max(named)[1] if named else None
+
+    every = collections.Counter(whos)
+    best = top(every)
+    whole = best if best and label_decision(every, best)[0] and (not hint or hint == best) else None
+    state = {}
+    for sid in sections:
+        votes = collections.Counter(who for who, w in zip(whos, where) if w == sid)
+        if not votes:
+            state[sid] = ("none", None)
+            continue
+        lead = top(votes)
+        keep, own, known = label_decision(votes, lead, MIN_CHAPTER_ANSWERS) if lead else (False, 0, 0)
+        state[sid] = ("sure", lead) if keep else ("few", None) if known < MIN_CHAPTER_ANSWERS else ("split", None)
+    sure = [(i, state[sid][1]) for i, sid in enumerate(sections) if state[sid][0] == "sure"]
+    plan = {}
+    for i, sid in enumerate(sections):
+        kind, owner = state[sid]
+        if kind == "sure":
+            plan[sid] = owner
+        elif kind == "split":
+            plan[sid] = None
+        elif kind == "few":
+            before = next((o for j, o in reversed(sure) if j < i), None)
+            after = next((o for j, o in sure if j > i), None)
+            plan[sid] = before if before and before == after else whole
+        else:
+            plan[sid] = whole
+    info = {"votes": dict(every.most_common()), "whole": whole,
+            "chapters": {sid: (state[sid][0], plan[sid]) for sid in sections if state[sid][0] != "none"}}
+    return plan, info
 
 
 def name_words(key: str) -> set:
@@ -1744,10 +1923,15 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
         problems.append(f"не распределено {len(missing)} — отнесены к «прочим»: {', '.join(missing[:15])}")
         other += missing
     alias: dict[str, set] = collections.defaultdict(set)
+    scope = set(r["sections"])
+
+    def within(c: dict, total: str, per_section: str) -> int:
+        counts = c.get(per_section)
+        return sum(n for sid, n in counts.items() if sid in scope) if isinstance(counts, dict) else c[total]
     for ch in characters:
         forms = collections.Counter()
-        ch["mentions"] = sum(candidates[ref]["count"] for ref in ch["candidates"])
-        ch["speaker"] = sum(candidates[ref]["speaker"] for ref in ch["candidates"])
+        ch["mentions"] = sum(within(candidates[ref], "count", "section_counts") for ref in ch["candidates"])
+        ch["speaker"] = sum(within(candidates[ref], "speaker", "speaker_sections") for ref in ch["candidates"])
         for ref in ch["candidates"]:
             forms.update(candidates[ref]["forms"])
             alias[candidates[ref]["key"]].add(ch["id"])
@@ -1790,15 +1974,47 @@ def apply(args) -> None:
         verdicts = verification_verdicts(checked, answer, r, candidates)
         if verdicts is None and answer and any(len(ch.get("candidates", [])) > 1 for ch in answer.get("characters", [])):
             verdicts = {}  # склейки без второй проверки не принимаются
-        labels = {}
+        labels, plans, report = {}, {}, {}
+        people = {str(ch.get("id", "")) for ch in answer.get("characters", []) if isinstance(ch, dict)}
+        folder = os.path.join(args.dir, "answers")
         for raw_id, ref in label_targets(r, answer, candidates):
-            name = os.path.join(args.dir, "answers", f"{r['name']}.label.{ref}")
-            prompt = label_prompt(r, answer, candidates, ref, collection)
-            if metadata_matches(load_answer(name + ".meta.json"), prompt, args.dir):
-                votes = label_votes(load_answer(name + ".json"), len(candidates[ref]["contexts"]))
-                if votes is not None:
-                    labels[(raw_id, ref)] = votes
-        casts.append(build_cast(r, answer, verdicts, candidates, r["name"] + "." if collection else "", labels))
+            whos = label_whos(folder, r["name"], r, answer, candidates, ref, collection,
+                              lambda meta, prompt: metadata_matches(meta, prompt, args.dir))
+            if whos is None:
+                continue  # нет ответа по отрывкам — действуют прежние строгие правила
+            if candidates[ref]["kind"] == "title":
+                where = candidates[ref].get("context_sections") or [r["sections"][0]] * len(whos)
+                plans[ref], report[ref] = title_plan(whos, where, r["sections"], people, raw_id)
+            elif raw_id:
+                labels[(raw_id, ref)] = collections.Counter(whos)
+                report[ref] = {"votes": dict(collections.Counter(whos).most_common()), "whole": raw_id}
+        # Главы с одинаковыми решениями по обращениям — один набор персонажей.
+        groups: dict[tuple, list] = {}
+        for sid in r["sections"]:
+            groups.setdefault(tuple((ref, plans[ref][sid]) for ref in sorted(plans)), []).append(sid)
+        for signature, sids in groups.items():
+            variant = json.loads(json.dumps(answer))
+            variant_verdicts = dict(verdicts or {})
+            variant_labels = dict(labels)
+            for ref, owner in signature:
+                for ch in variant.get("characters", []):
+                    if isinstance(ch, dict) and isinstance(ch.get("candidates"), list):
+                        ch["candidates"] = [x for x in ch["candidates"] if x != ref]
+                variant["other"] = [x for x in variant.get("other", []) if x != ref]
+                raw = next((ch for ch in variant.get("characters", []) if isinstance(ch, dict) and str(ch.get("id", "")) == owner), None)
+                if raw is None:
+                    variant["other"].append(ref)
+                    continue
+                raw["candidates"].append(ref)
+                anchor = character_refs(raw, r, candidates)[0]
+                if anchor != ref:
+                    variant_verdicts[(owner, anchor, ref)] = "same"  # подтверждено отрывками этой главы
+                variant_labels[(owner, ref)] = collections.Counter({owner: MIN_LABEL_ANSWERS})
+            cast = build_cast(dict(r, sections=sids), variant, variant_verdicts, candidates,
+                              r["name"] + "." if collection else "", variant_labels)
+            cast["label_report"] = {candidates[ref]["display"]: info for ref, info in report.items()}
+            cast["request"] = r["name"]
+            casts.append(cast)
     section_cast = {sid: i for i, cast in enumerate(casts) for sid in cast["sections"]}
     save(args.dir, "cast.json", {
         "book": data["book"], "scope": request["scope"], "input_sha256": artifact_identity(args.dir), "narrator": "author", "others": "other",
@@ -1836,7 +2052,23 @@ def voices(args) -> None:
     def meetings(a: dict, b: dict) -> int:
         return sum(candidates[x].get("together_counts", {}).get(y, 0) for x in a["candidates"] for y in b["candidates"])
 
-    for group in cast["casts"]:
+    # Роман по главам — несколько наборов с одними персонажами (разное только «чей генерал»): голоса раздаются
+    # один раз на всех, по самому полному виду каждого персонажа, — один человек звучит одинаково во всех главах.
+    families: dict[str, list] = collections.defaultdict(list)
+    for n, group in enumerate(cast["casts"]):
+        families[group.get("request", str(n))].append(group)
+    for family in families.values():
+        union: dict[str, dict] = {}
+        for group in family:  # наборы делят главы между собой: реплики и упоминания складываются
+            for ch in group["characters"]:
+                seen = union.get(ch["id"])
+                if seen is None:
+                    union[ch["id"]] = dict(ch, candidates=sorted(set(ch.get("candidates", []))))
+                else:
+                    seen["speaker"] += ch["speaker"]
+                    seen["mentions"] += ch["mentions"]
+                    seen["candidates"] = sorted(set(seen["candidates"]) | set(ch.get("candidates", [])))
+        group = {"characters": list(union.values())}
         # Rejected ambiguous titles must not erase the protagonist's voice priority.
         # Legacy casts without model priority keep their previous ordering.
         # Главные герои по оценке LLM — первыми (их голос не теряется, даже если обращение «князь» снято);
@@ -1865,10 +2097,13 @@ def voices(args) -> None:
             ch["voice"], ch["role"] = voice, role
             if role != "other":
                 holders[voice].append(ch)
-        group["voices"] = {"narrator": spec["narrator"], "other_m": spec["other_m"], "other_f": spec["other_f"]}
+        for member in family:
+            for ch in member["characters"]:
+                ch["voice"], ch["role"] = union[ch["id"]]["voice"], union[ch["id"]]["role"]
+            member["voices"] = {"narrator": spec["narrator"], "other_m": spec["other_m"], "other_f": spec["other_f"]}
     cast["voice_model"] = spec.get("model", "")
     save(args.dir, "cast.json", cast)
-    roles = collections.Counter(ch["role"] for g in cast["casts"] for ch in g["characters"])
+    roles = collections.Counter({(g.get("request"), ch["id"]): ch["role"] for g in cast["casts"] for ch in g["characters"]}.values())
     print(f"«{cast['book']}»: свой голос {roles['own']}, общий {roles['shared']}, «прочие» {roles['other']}; "
           f"голосов: мужских {len(pool['m'])}, женских {len(pool['f'])} (+ автор {spec['narrator']}, прочие "
           f"{spec['other_m']}/{spec['other_f']}), без пола не раздаются: {', '.join(unknown) or 'нет'}")
@@ -1924,9 +2159,65 @@ def export(args) -> None:
     }
     target = args.output or os.path.join(args.dir, re.sub(r"[^\w.-]+", "_", index["book"]["title"]) + ".mytts-book")
     save(os.path.dirname(os.path.abspath(target)), os.path.basename(target), data, compact=True)
+    write_report(args.dir, cast)
     total = sum(len(v) for v in by_section.values())
-    print(f"{target}: персонажей {sum(len(c['characters']) for c in casts)}, разделов {len(data['sections'])}, "
+    print(f"{target}: персонажей {len({(c.get('request'), ch['id']) for c in cast['casts'] for ch in c['characters'] if ch.get('role') != 'other' or args.keep_other})}, "
+          f"наборов {len(casts)}, разделов {len(data['sections'])}, "
           f"отпечатков {total}, {os.path.getsize(target) / 1024:.0f} КБ")
+
+
+def write_report(folder: str, cast: dict) -> None:
+    """отчёт.txt: кто каким голосом, что ушло в «прочие» и почему, чьи обращения в каких главах —
+    чтобы за минуту проверить книгу глазами перед загрузкой в телефон."""
+    titles = {s["id"]: s.get("title", s["id"]) for s in cast.get("sections", [])}
+    lines = [f"«{cast.get('book', '')}» — {'сборник' if cast.get('scope') == 'section' else 'роман'}, разделов {len(titles)}", ""]
+    families: dict[str, list] = collections.defaultdict(list)
+    for n, group in enumerate(cast["casts"]):
+        families[group.get("request", str(n))].append(group)
+    for family in families.values():
+        first = family[0]
+        lines.append("=" * 72)
+        lines.append(first.get("title", "") + (f" (наборов по главам: {len(family)})" if len(family) > 1 else ""))
+        union = {}
+        for group in family:
+            for ch in group["characters"]:
+                if ch["id"] not in union:
+                    union[ch["id"]] = dict(ch)
+                else:
+                    union[ch["id"]]["speaker"] = union[ch["id"]].get("speaker", 0) + ch.get("speaker", 0)
+                    union[ch["id"]]["mentions"] = union[ch["id"]].get("mentions", 0) + ch.get("mentions", 0)
+        role_name = {"own": "свой голос", "shared": "общий голос", "other": "голос «прочих»"}
+        for ch in sorted(union.values(), key=lambda ch: (ch.get("role") == "other", -ch.get("speaker", 0), -ch.get("mentions", 0))):
+            lines.append(f"  {ch.get('name', ch['id']):<34} {ch.get('gender', '?')}  {role_name.get(ch.get('role'), '?'):<15} "
+                         f"{ch.get('voice', ''):<13} реплик {ch.get('speaker', 0):<4} упоминаний {ch.get('mentions', 0):<5} "
+                         f"{', '.join(ch.get('forms', [])[:6])}")
+        reports = first.get("label_report") or {}
+        if reports:
+            lines.append("  Обращения и фамилии по отрывкам (кто это):")
+            for label, info in reports.items():
+                votes = ", ".join(f"{who} {n}" for who, n in list(info.get("votes", {}).items())[:4])
+                lines.append(f"    «{label}»: {votes}; на всю книгу — {info.get('whole') or 'прочие'}")
+                chapters = info.get("chapters") or {}
+                changes = [(sid, owner) for sid, (state, owner) in chapters.items() if owner != info.get("whole")]
+                for sid, owner in changes[:30]:
+                    lines.append(f"       {titles.get(sid, sid)}: {owner or 'прочие'}")
+        dropped = list(dict.fromkeys(line for group in family for line in group.get("dropped", [])))
+        if dropped:
+            lines.append("  Снято проверкой:")
+            lines += [f"    {line}" for line in dropped]
+        other = {}
+        for group in family:
+            for o in group.get("other", []):
+                other[o["candidate"]] = o
+        if other:
+            top = sorted(other.values(), key=lambda o: -o.get("count", 0))[:25]
+            lines.append("  В «прочих» (самые частые): " + ", ".join(f"{o.get('display', '')} ({o.get('count', 0)})" for o in top))
+        problems = list(dict.fromkeys(p for group in family for p in group.get("problems", [])))
+        if problems:
+            lines.append("  Замечания: " + "; ".join(problems))
+        lines.append("")
+    with open(os.path.join(folder, "отчёт.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def vectors(args) -> None:

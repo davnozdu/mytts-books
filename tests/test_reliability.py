@@ -494,10 +494,14 @@ class ResumeTests(unittest.TestCase):
         for url, body, auth in sent:
             self.assertEqual("https://api.deepseek.com/chat/completions", url)
             self.assertEqual("deepseek-flash", body["model"])
-            self.assertEqual({"type": "enabled"}, body["thinking"])
-            self.assertEqual("high", body["reasoning_effort"])
-            self.assertEqual(0.6, body["temperature"])
             self.assertEqual("Bearer not-a-real-key", auth)
+            if body["messages"][0]["content"].startswith("Кто назван"):  # отрывки — без размышления
+                self.assertEqual({"type": "disabled"}, body["thinking"])
+                self.assertEqual(0, body["temperature"])
+            else:
+                self.assertEqual({"type": "enabled"}, body["thinking"])
+                self.assertEqual("high", body["reasoning_effort"])
+                self.assertEqual(0.6, body["temperature"])
 
     def test_deepseek_token_limit_error_is_understood(self):
         error = b.urllib.error.HTTPError("https://api.deepseek.com", 400, "bad", {}, io.BytesIO(json.dumps(
