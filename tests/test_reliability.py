@@ -496,6 +496,22 @@ class ResumeTests(unittest.TestCase):
                 b.request_chat("deepseek", "https://api.deepseek.com", "deepseek-flash", "k", "p", True, 80000, 10)
         self.assertEqual(65536, caught.exception.max_output_tokens)
 
+    def test_length_cut_retries_with_shorter_thinking(self):
+        efforts = []
+        def chat(*args, effort=None):
+            efforts.append(effort)
+            if len(efforts) == 1:
+                return dict(content="", thinking_chars=9, thinking_control="high", done_reason="length", prompt_tokens=1, output_tokens=80000)
+            return self.chat(*args)
+        self.run_llm(chat)
+        self.assertEqual([None, "medium"], efforts[:2])
+        self.assertTrue((self.folder/"answers/book.failed1.txt").exists())
+
+    def test_minor_answer_deviations_are_normalized(self):
+        answer = b.normalize_answer({"characters": [{"id": 7, "name": None, "gender": "Ж", "candidates": ["c1"]}], "other": []})
+        self.assertTrue(b.valid_response(answer))
+        self.assertEqual("f", answer["characters"][0]["gender"])
+
     def test_resume_missing_verification_only(self):
         self.run_llm(); self.assertEqual(2,len(self.calls))
         (self.folder/"answers/book.verify.json").unlink()

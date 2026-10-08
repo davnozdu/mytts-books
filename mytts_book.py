@@ -849,7 +849,8 @@ def candidate_line(cid: str, c: Candidate, ids: dict) -> str:
     if near:
         bits.append("рядом: " + ", ".join(near))
     line = " | ".join(bits)
-    for e in c.examples[:3]:
+    # Три примера — частым кандидатам и обращениям (их чаще путают), редким — один: запрос не раздувается.
+    for e in c.examples[:3 if c.count >= 30 or c.kind == "title" else 2 if c.count >= 5 else 1]:
         line += f"\n    пример: {e}"
     return line
 
@@ -1007,7 +1008,10 @@ def thinking_control(values: list, enabled: bool):
     return enabled
 
 
-def ollama_thinking(endpoint: str, model: str, key: str, enabled: bool):
+EFFORTS = ("high", "medium", "low")
+
+
+def ollama_thinking(endpoint: str, model: str, key: str, enabled: bool, effort: str | None = None):
     cache_key = (endpoint.rstrip("/"), model)
     if cache_key not in _THINKING_CONTROLS:
         req = urllib.request.Request(endpoint.rstrip("/") + "/api/show", data=json.dumps({"model":model}).encode(),
@@ -1027,10 +1031,13 @@ def ollama_thinking(endpoint: str, model: str, key: str, enabled: bool):
     values = _THINKING_CONTROLS[cache_key]
     if enabled and values and thinking_control(values, True) is False:
         raise ValueError("Выбранная модель не поддерживает размышление")
+    if enabled and effort and effort in values:
+        return effort  # ступенью ниже, если на прежнем уровне размышление не уложилось в предел ответа
     return thinking_control(values, enabled)
 
 
-def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str, think: bool, max_tokens: int, timeout: int) -> dict:
+def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str, think: bool, max_tokens: int, timeout: int,
+                 effort: str | None = None) -> dict:
     """Один запрос. Возвращает content, thinking (длина), причину остановки и токены в общем виде."""
     if provider == "deepseek":
         # Оригинальный API DeepSeek (api.deepseek.com): размышление — thinking, ответ — в reasoning_content.
@@ -1039,10 +1046,10 @@ def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str
                 "thinking": {"type": "enabled" if think else "disabled"},
                 "messages": [{"role": "user", "content": prompt}]}
         if think:
-            body["reasoning_effort"] = "high"
+            body["reasoning_effort"] = effort or "high"
     else:
         url = endpoint.rstrip("/") + "/api/chat"
-        body = {"model": model, "stream": False, "think": ollama_thinking(endpoint, model, key, think), "options": {"temperature": 0, "num_predict": max_tokens},
+        body = {"model": model, "stream": False, "think": ollama_thinking(endpoint, model, key, think, effort), "options": {"temperature": 0, "num_predict": max_tokens},
                 "messages": [{"role": "user", "content": prompt}]}
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
@@ -1112,10 +1119,12 @@ def llm(args) -> None:
         model_key = (args.provider, args.endpoint, args.model)
         limit = min(requested_limit, _MODEL_LIMITS.get(model_key, requested_limit))
         delay = 2.0
+        effort = None
         for attempt in range(1, 4):
             started = time.time()
             try:
-                reply = request_chat(args.provider, args.endpoint, args.model, key, prompt, args.think, limit, args.timeout)
+                reply = request_chat(args.provider, args.endpoint, args.model, key, prompt, args.think, limit, args.timeout,
+                                     **({"effort": effort} if effort else {}))
             except LLMError as e:
                 if attempt < 3 and e.status == 400 and e.max_output_tokens and 0 < e.max_output_tokens < limit:
                     limit = e.max_output_tokens
@@ -1136,7 +1145,7 @@ def llm(args) -> None:
                 delay = min(120, delay * 2)
                 continue
             content = reply.pop("content")
-            answer = parse_answer(content)
+            answer = normalize_answer(parse_answer(content))
             if reply.get("done_reason") == "length" or not (check(answer) if check else valid_response(answer, verify)):
                 # Причина и сам ответ — для разбора: оборван по лимиту, нет JSON или JSON не той формы.
                 if reply.get("done_reason") == "length":
@@ -1150,10 +1159,15 @@ def llm(args) -> None:
                 with open(os.path.join(folder, f"{name}.failed{attempt}.txt"), "w", encoding="utf-8") as f:
                     f.write(content)
                 if attempt < 3:
+                    if reply.get("done_reason") == "length" and args.think:
+                        # Размышление не уложилось в предел ответа: следующая попытка — ступенью короче, но с размышлением.
+                        current = effort or reply.get("thinking_control") or "high"
+                        effort = EFFORTS[min(len(EFFORTS) - 1, EFFORTS.index(current) + 1)] if current in EFFORTS else "medium"
+                        why += f"; размышление: {effort}"
                     print(f"  [{name}] {why}; повторяем ({attempt + 1}/3)", flush=True)
                     continue
                 raise ValueError(f"LLM не вернула полный JSON нужного формата: {why}; ответ не сохранён")
-            meta = dict(reply, provider=args.provider, model=args.model, content_chars=len(content),
+            meta = dict(reply, provider=args.provider, model=args.model, content_chars=len(content), effort=effort,
                         request_sha256=identity(prompt), thinking=args.think, endpoint=args.endpoint, max_tokens=requested_limit, effective_max_tokens=limit, input_sha256=input_sha,
                         seconds=round(time.time() - started, 1), attempt=attempt)
             # Never expose a partly written reply as a completed cache entry.
@@ -1456,6 +1470,31 @@ def parse_answer(text: str) -> dict | None:
         return value if isinstance(value, dict) else None
     except (ValueError, TypeError):
         return None
+
+
+GENDERS = {"m": "m", "м": "m", "male": "m", "masc": "m", "муж": "m", "мужской": "m",
+           "f": "f", "ж": "f", "female": "f", "femn": "f", "жен": "f", "женский": "f"}
+
+
+def normalize_answer(answer: dict | None) -> dict | None:
+    """Мелкие отклонения формы не повод выбрасывать весь ответ: «м» → «m», номер числом → строкой."""
+    if not isinstance(answer, dict):
+        return answer
+    for ch in answer.get("characters", []) if isinstance(answer.get("characters"), list) else []:
+        if isinstance(ch, dict):
+            if "gender" in ch:
+                ch["gender"] = GENDERS.get(str(ch["gender"]).strip().lower(), "?")
+            if isinstance(ch.get("id"), (int, float)):
+                ch["id"] = str(ch["id"])
+            if ch.get("name") is None:
+                ch["name"] = ""
+    for check in answer.get("checks", []) if isinstance(answer.get("checks"), list) else []:
+        if isinstance(check, dict) and isinstance(check.get("verdict"), str):
+            check["verdict"] = check["verdict"].strip().lower()
+    for item in answer.get("answers", []) if isinstance(answer.get("answers"), list) else []:
+        if isinstance(item, dict) and isinstance(item.get("n"), str) and item["n"].strip().isdigit():
+            item["n"] = int(item["n"])
+    return answer
 
 
 def valid_response(answer: dict | None, verify: bool = False, kind: str = "") -> bool:
