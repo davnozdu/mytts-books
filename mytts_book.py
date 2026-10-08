@@ -1530,15 +1530,16 @@ def llm(args) -> None:
         prompt = verify_prompt(r, answer, by_id, request["scope"] == "section") if answer else None
         if not prompt:
             return line + "; проверять нечего"
-        verification = "из кэша" if cached(prompt, name + ".verify", True) else chat(prompt, name + ".verify", True)
-        checked = load_answer(os.path.join(folder, name + ".verify.json"))
-        if not verification_complete(checked, answer, r, by_id):
-            # A well-formed JSON may still omit/repeat a check or name the wrong anchor.
-            # Do not cache that as a complete verification, nor report a successful export.
-            if os.path.exists(os.path.join(folder, name + ".verify.meta.json")):
-                os.unlink(os.path.join(folder, name + ".verify.meta.json"))
-            raise ValueError("Проверка склеек неполна или относится к другой группе; повторите запуск")
-        return line + "; проверка: " + verification
+        complete = lambda checked: verification_complete(checked, answer, r, by_id)
+        if cached(prompt, name + ".verify", True, check=complete):
+            return line + "; проверка: из кэша"
+        try:  # неполный ответ (пропущены или повторены проверки) — повтор, до трёх попыток
+            return line + "; проверка: " + chat(prompt, name + ".verify", True, check=complete)
+        except ValueError:
+            # И после повторов неполно: берём ответ как есть. Непроверенные склейки не принимаются (apply),
+            # остальная книга обрабатывается — один неполный ответ не останавливает всё.
+            verification = chat(prompt, name + ".verify", True)
+            return line + "; проверка неполна (непроверенные склейки — в «прочих»): " + verification
 
     def check_labels(r: dict, answer: dict | None, name: str) -> str:
         """Обращения и голые фамилии: кто это в каждом из отрывков по всей книге."""

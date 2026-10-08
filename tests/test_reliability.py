@@ -618,10 +618,18 @@ class ResumeTests(unittest.TestCase):
         b.save(str(self.folder),"llm_request.json",{"scope":"book","requests":[self.r]})
         self.run_llm(); self.assertEqual(2,len(self.calls)); self.assertEqual("changed", self.calls[0])
 
-    def test_incomplete_verification_stops_pipeline(self):
+    def test_incomplete_verification_rejects_unverified_merges_but_finishes(self):
         self.checks = {"checks":[]}
-        with self.assertRaises(RuntimeError): self.run_llm()
-        self.assertFalse((self.folder/"answers/book.verify.meta.json").exists())
+        self.run_llm()  # три попытки, затем ответ как есть — книга обрабатывается дальше
+        self.assertEqual(5, len(self.calls))  # основной ответ, 3 попытки проверки, последняя — сохраняется как есть
+        data = b.read_json(str(self.folder/"candidates.json"))
+        data["book"], data["sections"] = "Fixture", [{"id": "s1", "title": "Test"}]
+        b.save(str(self.folder), "candidates.json", data)
+        self.calls.clear(); self.run_llm()  # новое извлечение — новые запросы
+        with contextlib.redirect_stdout(io.StringIO()):
+            b.apply(Namespace(dir=str(self.folder), show=0, show_casts=0))
+        cast = b.read_json(str(self.folder/"cast.json"))["casts"][0]
+        self.assertEqual(["c2"], cast["characters"][0]["candidates"])
 
     def test_truncated_json_is_not_cached(self):
         def truncated(*args):
