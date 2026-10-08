@@ -49,8 +49,16 @@ TITLES = {
     "полковник", "капитан", "поручик", "подпоручик", "майор", "господин", "госпожа", "мадам", "мадемуазель",
     "мсье", "сударь", "сударыня", "барыня", "барин", "доктор", "профессор", "чиновник", "купец", "купчиха",
 }
+NOT_DESCRIPTORS = {"другой", "первый", "второй", "последний", "остальной", "один", "оба", "голос", "кто", "никто", "всякий"}
 NOT_PEOPLE = {"бог", "господь", "господи", "христос", "богородица", "аллах", "сатана", "иисус"}
-CASE_ENDINGS = ("ами", "ому", "ему", "ыми", "ими", "ой", "ым", "им", "ом", "ем", "ых", "их", "а", "у", "е", "ы", "и", "ю", "я")
+CASE_ENDINGS = ("ами", "ями", "ому", "ему", "ыми", "ими", "ою", "ею", "ой", "ей", "ым", "им", "ом", "ем", "ых", "их",
+                "а", "у", "е", "ы", "и", "ю", "я")
+# Сколько отрывков по всей книге проверяет LLM для обращения или голой фамилии.
+LABEL_SAMPLES = 16
+# Меньше понятных ответов по отрывкам — решения по обращению нет (оно в «прочих»).
+MIN_LABEL_ANSWERS = 3
+SINGLE_SURNAME = re.compile(r"^[а-яё-]{3,}(?:ов|ев|ёв|ин|ын)$")
+FAMILY_SURNAME = re.compile(r"(?<=[а-яё]{2})(ов|ев|ёв|ин|ын)(?:ы|ых|ыми)$")
 CASES = ("nomn", "gent", "datv", "accs", "ablt", "loct", "voct", "gen2", "acc2", "loc2")
 
 
@@ -207,6 +215,8 @@ class Candidate:
     forms: collections.Counter = field(default_factory=collections.Counter)    # как написано в книге
     sections: collections.Counter = field(default_factory=collections.Counter)
     examples: list = field(default_factory=list)
+    spots: list = field(default_factory=list)   # (абзац, начало, конец) каждого упоминания
+    descriptor: bool = False      # «черномазый», «камердинер»: так назван говорящий в ремарке
     together: collections.Counter = field(default_factory=collections.Counter)
 
 
@@ -293,7 +303,12 @@ class Extractor:
         options = [[p for p in opt if "sing" in p.tag.grammemes or "Sgtm" in p.tag.grammemes] for opt in named]
         if expected_gender:
             options = [[p for p in opt if p.tag.gender == expected_gender] or opt for opt in options]
-        family = any(self.named(w) and not opt for w, opt in zip(words, options))
+        # «Улямов», «Бахмутов» словарь разбирает только как множественное («Улям», «Бахмут»), но это фамилия
+        # одного человека; «Бобриковы», «Бобриковых» — семья, даже если словарь фамилии не знает.
+        surname_nom = [bool(SINGLE_SURNAME.search(w.lower())) and bool(self.named(w)) and not opt
+                       for w, opt in zip(words, options)]
+        family = any((self.named(w) and not opt and not single) or (not self.named(w) and FAMILY_SURNAME.search(w.lower()))
+                     for w, opt, single in zip(words, options, surname_nom))
         shared = None
         for opt in options:
             if opt:
@@ -303,8 +318,17 @@ class Extractor:
         agreed_gender = expected_gender or (next(iter(genders)) if len(genders) == 1 else None)
         keys, info = [], []
         nominative = True
-        for w, opt in zip(words, options):
+        for w, opt, single in zip(words, options, surname_nom):
             low = w.lower().replace("ё", "е")
+            if single:
+                keys.append(low)
+                info.append(("m", "Surn"))
+                continue
+            if not opt and not self.named(w) and FAMILY_SURNAME.search(low):
+                keys.append(FAMILY_SURNAME.sub(lambda m: m.group(1), low))  # «бобриковых» → «бобриков»
+                info.append((None, "Surn"))
+                nominative = False
+                continue
             if not opt:
                 parses = self.named(w)
                 if parses:  # только множественное: «Епанчиных» — семья
@@ -333,7 +357,16 @@ class Extractor:
             # Одна форма — разные слова («Лебедева»: его или она; «Александра»): чаще встречающаяся в книге.
             # Словарь может не знать уменьшительного («Кирюху» → «кирюх»): тогда форма, которая есть в книге.
             fallback = self.unknown_base(low, agreed_gender)
-            if fallback != low and fallback not in forms and all(self.capitalized[f] == 0 for f in forms) and self.capitalized[fallback] > 0:
+            # Сама форма из текста — ключ, только если она похожа на именительный уменьшительного имени
+            # («Владя» по словарю — падеж несуществующего «Владь»), но не «Афанасием» или «Ивановича».
+            as_written = fallback == low and low.endswith(("а", "я")) and self.capitalized[low] >= 3 \
+                and all("Name" in p.tag.grammemes for p in opt)
+            if (fallback != low or as_written) and fallback not in forms and all(self.capitalized[f] == 0 for f in forms) \
+                    and self.capitalized[fallback] > 0:
+                forms[fallback] = forms[max(forms, key=lambda f: self.capitalized[f])]
+            # Словарь видит в «Влади» несклоняемую фамилию, а в книге 148 раз «Владя» — это его падеж.
+            if fallback != low and fallback not in forms and self.capitalized[fallback] >= 5 * max(
+                    self.capitalized[f] for f in forms) and all("Fixd" in p.tag.grammemes or "Name" in p.tag.grammemes for p in opt):
                 forms[fallback] = forms[max(forms, key=lambda f: self.capitalized[f])]
             key = max(forms, key=lambda f: (self.capitalized[f], f == low))
             chosen = forms[key][0]
@@ -364,13 +397,18 @@ class Extractor:
                     base = stem + suffix
                     if len(stem) >= 3 and allowed(base) and self.capitalized[base] >= max(2, self.capitalized[low] // 4):
                         return base
+        # Из всех основ — самая частая в книге: «Кирюху» → «Кирюха» (48), а не звательное «Кирюх» (2).
+        bases = []
         for ending in CASE_ENDINGS:
             if low.endswith(ending) and len(low) - len(ending) >= 3:
                 stem = low[: -len(ending)]
                 for base in (stem, stem + "о", stem + "а", stem + "я", stem + "ь"):
                     if base != low and allowed(base) and self.capitalized[base] >= max(2, self.capitalized[low] // 4):
-                        return base
-        return low
+                        # «Кирюха» само может быть именительным: к «Кирюх» — только если та форма чаще.
+                        if ending in ("а", "я") and base == stem and self.capitalized[base] <= self.capitalized[low]:
+                            continue
+                        bases.append(base)
+        return max(bases, key=lambda base: self.capitalized[base]) if bases else low
 
     def name_can_continue(self, words: list[str], following: str) -> bool:
         """Adjacent names must agree; an addressee and a speaker are not one long name."""
@@ -385,15 +423,27 @@ class Extractor:
                 shared = values if shared is None else shared & values
         if shared and next_options and not shared & {(p.tag.case, p.tag.gender) for p in next_options}:
             return False
+        def surname_like(word):  # «Рогожин» нет в словаре; «Лебедеву» — только фамилия
+            parses = self.named(word)
+            return not parses or all("Surn" in p.tag.grammemes for p in parses)
+        if surname_like(words[-1]) and surname_like(following):
+            return False  # «сказал Рогожин Лебедеву»: две фамилии подряд — два человека
         if any("Patr" in p.tag.grammemes for opt in previous for p in opt):
             roles = {role for p in next_options for role in ("Name", "Patr", "Surn") if role in p.tag.grammemes}
             if "Name" in roles and "Surn" not in roles:
                 return False
         return True
 
+    def title_agrees(self, title, word: str) -> bool:
+        """«князь Мышкин» — одно лицо; «сказал князь Рогожину» — князь и адресат в другом падеже."""
+        cases = {p.tag.case for p in self.named(word)}
+        return not cases or title.tag.case in cases or not {"nomn", "gent", "datv", "accs", "ablt", "loct"} & cases
+
     def run(self, book: Book, per_section: bool) -> dict:
         self.statistics(book.paragraphs)
         candidates: dict[tuple, Candidate] = {}
+
+        paragraph = -1
 
         def add(key, kind, section, text, start, end) -> Candidate:
             scope = section if per_section else 0
@@ -402,9 +452,11 @@ class Extractor:
             cand.sections[section] += 1
             if len(cand.examples) < 6 and (cand.count <= 3 or cand.count in (10, 40, 100)):
                 cand.examples.append(snippet(text, start, end))
+            cand.spots.append((paragraph, start, end))
             return cand
 
         for section, text in book.paragraphs:
+            paragraph += 1
             words = list(WORD.finditer(text))
             mentions: list[Mention] = []
             i = 0
@@ -414,9 +466,15 @@ class Extractor:
                 title = None
                 parsed = self.first(low)
                 if parsed.normal_form in TITLES:
+                    single = [p for p in self.cache[low] if p.normal_form in TITLES and "plur" not in p.tag.grammemes]
+                    if not single:
+                        i += 1  # «господа», «князей Мышкиных» — не один человек
+                        continue
+                    parsed = single[0]  # «доктора» — скорее «у доктора», чем «доктора пришли»
                     title = parsed.normal_form
                     j = i + 1
-                    if j < len(words) and text[m.end():words[j].start()] == " " and self.is_name(words[j].group(), False):
+                    if j < len(words) and text[m.end():words[j].start()] == " " and self.is_name(words[j].group(), False) \
+                            and self.title_agrees(parsed, words[j].group()):
                         i = j  # титул перед именем: «генерал Иволгин»
                         m = words[i]
                     else:
@@ -470,9 +528,17 @@ class Extractor:
                 gap = text[name.end:mention.start]
                 if len(gap) <= 64 and re.fullmatch(r"\s*,\s*(?:[А-ЯЁа-яё-]+\s+){0,3}", gap):
                     qualifiers = [self.first(w.group()) for w in WORD.finditer(gap)]
-                    if all(q.tag.POS in ("ADJF", "PRTF", "ADVB") for q in qualifiers):
+                    # «Иван Петрович, отставной генерал» — да; «Рогожин, князь же…» — перечисление, не приложение.
+                    if qualifiers and all(q.tag.POS in ("ADJF", "PRTF", "ADVB") for q in qualifiers) \
+                            and any(q.tag.POS in ("ADJF", "PRTF") for q in qualifiers):
                         name.cand.titles[mention.cand.key] += 1
-            self.attribute_speakers(text, mentions)
+            def describe(key, start, end, gender, section=section, text=text):
+                cand = add(key, "title", section, text, start, end)
+                cand.descriptor = True
+                cand.forms[text[start:end]] += 1
+                cand.speaker += 1
+                cand.genders["verb:" + ("f" if gender == "femn" else "m")] += 1
+            self.attribute_speakers(text, mentions, describe)
             present = {id(x.cand): x.cand for x in mentions}
             for a in present.values():
                 for b in present.values():
@@ -480,8 +546,9 @@ class Extractor:
                         a.together[b.key] += 1
         return candidates
 
-    def attribute_speakers(self, text: str, mentions: list[Mention]) -> None:
-        """«— Реплика, — сказал князь. — Ещё реплика»: ремарки — нечётные куски между тире."""
+    def attribute_speakers(self, text: str, mentions: list[Mention], describe=None) -> None:
+        """«— Реплика, — сказал князь. — Ещё реплика»: ремарки — нечётные куски между тире.
+        describe(слово, начало, конец) — говорящий назван не именем: «— спросил черномазый», «— промычал лакей»."""
         if not text.startswith(("—", "–")):
             return
         offset = 1
@@ -495,36 +562,93 @@ class Extractor:
                 continue
             # A dash inside a spoken sentence is not necessarily a narrator's remark.
             # Only a nearby subject and past-tense verb in the opening clause count.
-            clause = re.split(r"[.!?…;]", part, maxsplit=1)[0][:180]
+            clause = re.split(r"[.!?…;:(]", part, maxsplit=1)[0][:180]
             inside = [m for m in mentions if start <= m.start < start + len(clause)
                       and m.end <= start + len(clause) and m.nominative and m.cand.kind != "family"]
+            verbs = [(w, self.first(w.group())) for w in WORD.finditer(clause)]
+            verbs = [(w, p) for w, p in verbs if p.tag.POS == "VERB" and "past" in p.tag.grammemes]
             if not inside:
+                if describe and verbs:
+                    self.describe_speaker(clause, start, verbs[0], describe)
                 continue
             pairs = []
-            for w in WORD.finditer(clause):
-                parsed = self.first(w.group())
-                if parsed.tag.POS != "VERB" or "past" not in parsed.tag.grammemes:
-                    continue
+            for w, parsed in verbs:
                 for mention in inside:
                     left, right = sorted(((mention.start-start, mention.end-start), (w.start(), w.end())))
                     gap = clause[left[1]:right[0]]
-                    if len(gap) > 48 or re.search(r"[,.:;!?…]", gap):
+                    if len(gap) > 48 or re.search(r"[.:;!?…]", gap):
                         continue
+                    if "," in gap and not all(self.first(x.group()).tag.POS in ("ADVB", "PRCL", "CONJ", "PRED")
+                                              for x in WORD.finditer(gap)):
+                        continue  # «— удивился, наконец, Рогожин» — да; «— сказал он, и Рогожин…» — нет
                     if any(other != mention and left[1] <= other.start-start < right[0] for other in inside):
                         continue
-                    pairs.append((len(gap), mention, parsed))
+                    pairs.append(("," in gap, len(gap), mention, parsed))
             if not pairs:
                 continue
-            _, mention, verb = min(pairs, key=lambda pair: pair[0])
+            *_, mention, verb = min(pairs, key=lambda pair: pair[:2])
             speaker = mention.cand
             speaker.speaker += 1
             if verb.tag.gender in ("masc", "femn"):
                 speaker.genders["verb:" + ("f" if verb.tag.gender == "femn" else "m")] += 1
 
+    def describe_speaker(self, clause: str, start: int, verb, describe) -> None:
+        """Сразу после глагола речи — существительное-лицо или субстантивное прилагательное в именительном
+        («— спросил черномазый», «— промычал удивленный лакей»): такой говорящий тоже кандидат."""
+        w, parsed = verb
+        if parsed.tag.gender not in ("masc", "femn"):
+            return
+        rest = list(WORD.finditer(clause, w.end()))
+        for n, x in enumerate(rest[:4]):
+            if re.search(r"[,—–]", clause[(rest[n - 1].end() if n else w.end()):x.start()]):
+                return
+            p = self.first(x.group())
+            low = x.group().lower()
+            if x.group()[0].isupper() or low in TITLES:
+                return  # имя или обращение уже учтены как упоминание
+            if p.tag.POS == "NOUN" and p.tag.case == "nomn" and "anim" in p.tag.grammemes and "sing" in p.tag.grammemes \
+                    and p.tag.gender == parsed.tag.gender:
+                describe(p.normal_form.replace("ё", "е"), start + x.start(), start + x.end(), parsed.tag.gender)
+                return
+            if {"Apro", "Anum"} & set(p.tag.grammemes) or p.normal_form in NOT_DESCRIPTORS:
+                return  # «— отвечал тот», «— сказал другой»: кто это — неизвестно
+            if p.tag.POS in ("ADJF", "PRTF") and p.tag.case == "nomn" and p.tag.gender == parsed.tag.gender:
+                if n + 1 == len(rest) or clause[x.end():rest[n + 1].start()].strip():
+                    describe(low.replace("ё", "е"), start + x.start(), start + x.end(), parsed.tag.gender)
+                    return
+                continue
+            if p.tag.POS not in ("ADVB", "PRCL"):
+                return
+
 
 def snippet(text: str, start: int, end: int, width: int = 70) -> str:
     left, right = max(0, start - width), min(len(text), end + width)
     return ("…" if left else "") + text[left:start] + "[[" + text[start:end] + "]]" + text[end:right] + ("…" if right < len(text) else "")
+
+
+def needs_contexts(c: Candidate) -> bool:
+    """Обращение («генерал») и голая фамилия могут означать разных людей: для них — отрывки по всей книге."""
+    return c.kind == "title" or (c.kind == "name" and " " not in c.key and bool(c.roles.get("Surn")))
+
+
+def label_contexts(book: Book, c: Candidate, limit: int) -> list[str]:
+    """Равномерно по книге: предыдущий абзац (того же раздела) и абзац с упоминанием, слово в [[…]]."""
+    if len(c.spots) <= limit:
+        chosen = c.spots
+    else:
+        step = len(c.spots) / limit
+        chosen = [c.spots[int(i * step + step / 2)] for i in range(limit)]
+    out = []
+    for paragraph, start, end in chosen:
+        section, text = book.paragraphs[paragraph]
+        left = max(0, start - 320)
+        before = ("…" if left else "") + text[left:start]
+        if start < 200 and paragraph > 0 and book.paragraphs[paragraph - 1][0] == section:
+            previous = book.paragraphs[paragraph - 1][1]
+            before = ("…" if len(previous) > 220 else "") + previous[-220:] + "\n" + before
+        right = min(len(text), end + 160)
+        out.append(before + "[[" + text[start:end] + "]]" + text[end:right] + ("…" if right < len(text) else ""))
+    return out
 
 
 def gender_source(c: Candidate) -> tuple[str, str | None]:
@@ -614,6 +738,19 @@ VERIFY = """Проверка сопоставления персонажей в 
 {groups}
 """
 
+LABELS = """Кто назван словом в [[…]] в каждом отрывке из {what}?
+Персонажи (id: имя; как ещё называется):
+{people}
+
+Для каждого отрывка ответь id персонажа из списка; "other" — другой человек (нет в списке) или не человек;
+"unsure" — по отрывку нельзя понять. Решай по самому отрывку: кто говорит, к кому обращаются, кто действует
+рядом. Ответ — только JSON без пояснений, по одному ответу на каждый номер:
+{{"answers": [{{"n": 1, "who": "id"}}]}}
+
+Отрывки (слово «{label}»):
+{snippets}
+"""
+
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -660,6 +797,8 @@ def extract(args) -> None:
         found = Extractor().run(book, per_section=True)
     groups: dict[int, list] = collections.defaultdict(list)
     for c in found.values():
+        if c.descriptor and c.speaker < 2 and not c.titles:
+            continue  # описание говорящего, встреченное один раз, — не персонаж
         if c.count >= args.min_count or c.speaker > 0 or (c.kind == "name" and (c.roles.get("Name") or c.roles.get("Patr"))):
             groups[c.scope].append(c)
     os.makedirs(args.out, exist_ok=True)
@@ -680,6 +819,7 @@ def extract(args) -> None:
                 # Сколько абзацев с каждым кандидатом: голос делят только те, кто почти не встречается.
                 "together_counts": {ids[(scope, k)]: n for k, n in c.together.most_common() if (scope, k) in ids},
                 "examples": c.examples,
+                **({"contexts": label_contexts(book, c, LABEL_SAMPLES)} if needs_contexts(c) else {}),
             })
         if not ranked:
             continue
@@ -887,15 +1027,16 @@ def llm(args) -> None:
         return cache_fingerprint(args.provider, args.endpoint, args.model, args.think, prompt,
                                  args.max_tokens or MAX_TOKENS[args.provider]["think" if args.think else "plain"], input_sha)
 
-    def cached(prompt: str, name: str, verify: bool = False) -> bool:
+    def cached(prompt: str, name: str, verify: bool = False, check=None) -> bool:
         if args.redo:
             return False
         answer = load_answer(os.path.join(folder, name + ".json"))
         meta = load_answer(os.path.join(folder, name + ".meta.json"))
-        return bool(valid_response(answer, verify) and meta and meta.get("request_sha256") == identity(prompt)
+        good = check(answer) if check else valid_response(answer, verify)
+        return bool(good and meta and meta.get("request_sha256") == identity(prompt)
                     and meta.get("done_reason") != "length")
 
-    def chat(prompt: str, name: str, verify: bool = False) -> str:
+    def chat(prompt: str, name: str, verify: bool = False, check=None) -> str:
         requested_limit = args.max_tokens or MAX_TOKENS[args.provider]["think" if args.think else "plain"]
         model_key = (args.provider, args.endpoint, args.model)
         limit = min(requested_limit, _MODEL_LIMITS.get(model_key, requested_limit))
@@ -925,7 +1066,7 @@ def llm(args) -> None:
                 continue
             content = reply.pop("content")
             answer = parse_answer(content)
-            if reply.get("done_reason") == "length" or not valid_response(answer, verify):
+            if reply.get("done_reason") == "length" or not (check(answer) if check else valid_response(answer, verify)):
                 if attempt < 3:
                     print(f"  [{name}] неполный или некорректный ответ; повторяем ({attempt + 1}/3)", flush=True)
                     continue
@@ -940,10 +1081,26 @@ def llm(args) -> None:
                     f"токенов {meta['prompt_tokens']}→{meta['output_tokens']}, {meta['done_reason']}")
         raise RuntimeError("Не удалось получить ответ LLM")
 
+    votes = max(1, getattr(args, "votes", 1) or 1)
+
     def ask(r: dict) -> str:
         name = r["name"]
-        line = "основной ответ из кэша" if cached(r["prompt"], name) else chat(r["prompt"], name)
+        if votes == 1:
+            line = "основной ответ из кэша" if cached(r["prompt"], name) else chat(r["prompt"], name)
+        else:
+            # Несколько независимых ответов: склейка остаётся, только если её дало большинство.
+            parts = []
+            for n in range(1, votes + 1):
+                run = f"{name}.run{n}"
+                parts.append(f"{n}: " + ("из кэша" if cached(r["prompt"], run) else chat(r["prompt"], run).split(",")[0]))
+            runs = [load_answer(os.path.join(folder, f"{name}.run{n}.json")) for n in range(1, votes + 1)]
+            combined = combine_answers(runs, r, by_id)
+            meta = load_answer(os.path.join(folder, f"{name}.run1.meta.json"))
+            save(folder, name + ".json", combined)
+            save(folder, name + ".meta.json", dict(meta, votes=votes, done_reason="stop"))
+            line = f"ответов {votes} ({'; '.join(parts)})"
         answer = load_answer(os.path.join(folder, name + ".json"))
+        line += check_labels(r, answer, name)
         prompt = verify_prompt(r, answer, by_id, request["scope"] == "section") if answer else None
         if not prompt:
             return line + "; проверять нечего"
@@ -956,6 +1113,21 @@ def llm(args) -> None:
                 os.unlink(os.path.join(folder, name + ".verify.meta.json"))
             raise ValueError("Проверка склеек неполна или относится к другой группе; повторите запуск")
         return line + "; проверка: " + verification
+
+    def check_labels(r: dict, answer: dict | None, name: str) -> str:
+        """Обращения и голые фамилии: кто это в каждом из отрывков по всей книге."""
+        if not answer:
+            return ""
+        done = 0
+        for _, ref in label_targets(r, answer, by_id):
+            prompt = label_prompt(r, answer, by_id, ref, request["scope"] == "section")
+            count = len(by_id[ref]["contexts"])
+            check = lambda a, count=count: label_votes(a, count) is not None
+            label = f"{name}.label.{ref}"
+            if not cached(prompt, label, check=check):
+                chat(prompt, label, check=check)
+            done += 1
+        return f"; обращений и фамилий проверено по отрывкам: {done}" if done else ""
 
     started = time.time()
     todo = request["requests"]
@@ -1027,7 +1199,7 @@ def verification_verdicts(checked: dict | None, answer: dict | None, r: dict, ca
             continue
         key = (pair[0], pair[1], ref)
         seen[key] += 1
-        verdicts[key] = check.get("verdict") if seen[key] == 1 else "unsure"
+        verdicts[key] = check.get("verdict") if seen[key] == 1 else "invalid"  # повтор — испорченный ответ
     return verdicts
 
 
@@ -1056,6 +1228,108 @@ def describe(c: dict) -> str:
     for e in c["examples"][:3]:
         text += f"\n      пример: {e}"
     return text
+
+
+def label_targets(r: dict, answer: dict, by_id: dict) -> list[tuple[str, str]]:
+    """(id персонажа, кандидат) для каждого обращения или голой фамилии, которые LLM отнесла к персонажу."""
+    out = []
+    raw_characters = answer.get("characters", [])
+    for raw in raw_characters if isinstance(raw_characters, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        for ref in character_refs(raw, r, by_id):
+            if len(by_id[ref].get("contexts") or []) >= MIN_LABEL_ANSWERS:
+                out.append((str(raw.get("id", "")), ref))
+    return out
+
+
+def label_prompt(r: dict, answer: dict, by_id: dict, ref: str, collection: bool) -> str:
+    people = []
+    for raw in answer.get("characters", []):
+        if not isinstance(raw, dict):
+            continue
+        forms = collections.Counter()
+        for x in character_refs(raw, r, by_id):
+            if x != ref:
+                forms.update(by_id[x]["forms"])
+        names = ", ".join(f for f, _ in forms.most_common(6))
+        people.append(f"- {raw.get('id', '')}: {raw.get('name', '')}" + (f" ({names})" if names else ""))
+    snippets = "\n".join(f"{n}. {text}" for n, text in enumerate(by_id[ref]["contexts"], 1))
+    what = f"рассказа «{r['title']}»" if collection else f"книги «{r['title']}»"
+    return LABELS.format(what=what, people="\n".join(people), label=by_id[ref]["display"], snippets=snippets)
+
+
+def label_votes(checked: dict | None, count: int) -> collections.Counter | None:
+    """Голоса «кто это» по отрывкам; None — ответ неполный или с повторами номеров."""
+    if not valid_response(checked, kind="labels"):
+        return None
+    numbers = [a["n"] for a in checked["answers"]]
+    if sorted(numbers) != list(range(1, count + 1)):
+        return None
+    return collections.Counter(a["who"] for a in checked["answers"])
+
+
+def combine_answers(answers: list, r: dict, by_id: dict) -> dict:
+    """Несколько независимых ответов → один: вместе только те, кого объединило большинство ответов.
+    Сопоставление литературного текста у LLM меняется от запуска к запуску; голосование убирает случайные
+    склейки и случайные потери."""
+    if len(answers) == 1:
+        return answers[0]
+    need = len(answers) // 2 + 1
+    own = set(r["candidates"])
+    together, person = collections.Counter(), collections.Counter()
+    runs = []
+    for answer in answers:
+        groups = []
+        for rank, raw in enumerate(answer.get("characters", [])):
+            if not isinstance(raw, dict):
+                continue
+            refs = [x for x in dict.fromkeys(raw.get("candidates", [])) if isinstance(x, str) and x in own]
+            groups.append((rank, raw, refs))
+            person.update(refs)
+            for a in refs:
+                for b in refs:
+                    if a < b:
+                        together[(a, b)] += 1
+        runs.append(groups)
+    parent = {x: x for x in own}
+
+    def root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for (a, b), n in together.items():
+        if n >= need and person[a] >= need and person[b] >= need:
+            parent[root(a)] = root(b)
+    components = collections.defaultdict(list)
+    for x in r["candidates"]:
+        if person[x] >= need:
+            components[root(x)].append(x)
+    entries = []
+    for refs in components.values():
+        ids, names, genders, ranks = collections.Counter(), collections.Counter(), collections.Counter(), []
+        for groups in runs:
+            hits = [(rank, raw) for rank, raw, members in groups if set(members) & set(refs)]
+            ranks.append(min((rank for rank, _ in hits), default=len(groups)))
+            for _, raw in hits:
+                weight = len(set(refs) & set(next(m for rk, rw, m in groups if rw is raw)))
+                ids[str(raw.get("id", ""))] += weight
+                names[str(raw.get("name", ""))] += weight
+                genders[raw.get("gender") if raw.get("gender") in ("m", "f", "?") else "?"] += weight
+        entries.append({"rank": sum(ranks) / len(ranks), "ids": ids, "name": names.most_common(1)[0][0],
+                        "gender": genders.most_common(1)[0][0], "candidates": refs})
+    # Идентификатор — тот, что чаще всего давали этой группе; спорный достаётся группе с большим числом голосов.
+    taken = {}
+    for votes, n, ident in sorted(((v, n, ident) for n, e in enumerate(entries) for ident, v in e["ids"].items()), reverse=True):
+        if ident not in taken.values() and n not in taken:
+            taken[n] = ident
+    result = []
+    for n, e in sorted(enumerate(entries), key=lambda item: item[1]["rank"]):
+        ident = taken.get(n) or f"person_{n + 1}"
+        result.append({"id": ident, "name": e["name"], "gender": e["gender"], "candidates": e["candidates"]})
+    placed = {x for ch in result for x in ch["candidates"]}
+    return {"characters": result, "other": [x for x in r["candidates"] if x not in placed], "votes": len(answers)}
 
 
 # ---------------------------------------------------------------- проверка ответа
@@ -1102,9 +1376,13 @@ def parse_answer(text: str) -> dict | None:
         return None
 
 
-def valid_response(answer: dict | None, verify: bool = False) -> bool:
+def valid_response(answer: dict | None, verify: bool = False, kind: str = "") -> bool:
     if not isinstance(answer, dict):
         return False
+    if kind == "labels":
+        return isinstance(answer.get("answers"), list) and all(
+            isinstance(a, dict) and isinstance(a.get("n"), int) and not isinstance(a.get("n"), bool)
+            and isinstance(a.get("who"), str) for a in answer["answers"])
     if verify:
         return isinstance(answer.get("checks"), list) and all(isinstance(c, dict) and
             all(isinstance(c.get(k), str) for k in ("character", "anchor", "candidate")) and
@@ -1124,7 +1402,48 @@ def load_answer(path: str) -> dict | None:
         return None
 
 
-def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: dict, prefix: str) -> dict:
+# Обращение или голая фамилия остаются у персонажа, если в его пользу не меньше этой доли упоминаний.
+DOMINANCE = 0.8
+PATRONYMIC_SHORT = ((r"ович$", "ыч"), (r"евич$", "ич"))
+
+
+def label_decision(votes: collections.Counter, owner: str) -> tuple[bool, int, int]:
+    """(оставить ли, в пользу owner, понятных ответов) по ответам «кто это» в отрывках."""
+    known = sum(n for who, n in votes.items() if who != "unsure")
+    own = votes.get(owner, 0)
+    enough = known >= max(MIN_LABEL_ANSWERS, sum(votes.values()) / 2)
+    return enough and own >= DOMINANCE * known, own, known
+
+
+def name_words(key: str) -> set:
+    words = set()
+    for word in key.split():
+        for pattern, short in PATRONYMIC_SHORT:
+            word = re.sub(pattern, short, word)
+        words.add(word)
+    return words
+
+
+def merge_accepted(verdict, anchor: str, ref: str, group: list, own_ids: set, candidates: dict) -> bool:
+    """Склейку разрешает «same» второго запроса. «unsure» — только если короткое имя целиком входит в полное
+    («Аглая» ⊂ «Аглая Ивановна», «Евгений Павлыч» ⊂ «Евгений Павлович Радомский») и больше ни в чьё."""
+    if verdict == "same":
+        return True
+    if verdict != "unsure":
+        return False
+    a, b = candidates[anchor], candidates[ref]
+    if a["kind"] != "name" or b["kind"] != "name":
+        return False
+    wa, wb = name_words(a["key"]), name_words(b["key"])
+    short, long_ = (wa, wb) if len(wa) <= len(wb) else (wb, wa)
+    if not short or not short < long_ or (a["gender"] in "mf" and b["gender"] in "mf" and a["gender"] != b["gender"]):
+        return False
+    return not any(short <= name_words(candidates[x]["key"]) for x in own_ids
+                   if x not in group and candidates[x]["kind"] == "name")
+
+
+def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: dict, prefix: str,
+               labels: dict | None = None) -> dict:
     """Проверенный ответ: каждый кандидат ровно у одного персонажа или в «прочих». К персонажу остаются
     только подтверждённые второй проверкой («same») и не противоречащие ему по роду; остальное — «прочие»."""
     problems: list[str] = []
@@ -1174,7 +1493,8 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
             elif gender in ("m", "f") and candidate["gender"] in ("m", "f") and candidate["gender"] != gender \
                     and candidate.get("gender_source") in ("verb", "Patr", "Title"):
                 dropped.append(f"{ref} {candidate['display']} → прочие: род {candidate['gender']}, у {cid} {gender}")
-            elif ref != anchor and (anchor not in own or not verdicts or verdicts.get((str(raw.get("id", "")), anchor, ref)) != "same"):
+            elif ref != anchor and (anchor not in own or not verdicts or not merge_accepted(
+                    verdicts.get((str(raw.get("id", "")), anchor, ref)), anchor, ref, refs, own_ids, candidates)):
                 dropped.append(f"{ref} {candidate['display']} → прочие: склейка с {anchor} не подтверждена для {cid}")
             else:
                 used[ref] = cid
@@ -1183,31 +1503,58 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
             problems.append(f"{cid}: нет ни одного кандидата — пропущен")
             continue
         characters.append({"id": cid, "name": str(raw.get("name") or ""), "gender": gender,
-                           "priority": priority, "candidates": own})
+                           "priority": priority, "candidates": own, "source_id": str(raw.get("id", ""))})
+    labels = labels or {}
+
+    def drop_with_dependents(ch: dict, ref: str, reason: str) -> None:
+        was_anchor = ch["candidates"][0] == ref
+        ch["candidates"].remove(ref)
+        used[ref] = "other"
+        dropped.append(f"{ref} {candidates[ref]['display']} → прочие: {reason}")
+        if was_anchor and candidates[ref]["kind"] == "name":
+            for dependent in ch["candidates"]:
+                used[dependent] = "other"
+                dropped.append(f"{dependent} {candidates[dependent]['display']} → прочие: склейка зависит от неоднозначной формы {ref}")
+            ch["candidates"] = []
+
+    # Обращение или голая фамилия, проверенные по отрывкам всей книги: остаются, только если почти везде это он.
+    for ch in characters:
+        for ref in list(ch["candidates"]):
+            votes = labels.get((ch["source_id"], ref))
+            if votes is None or ref not in ch["candidates"]:
+                continue
+            keep, own, known = label_decision(votes, ch["source_id"])
+            if keep and (candidates[ref]["kind"] != "title" or len(ch["candidates"]) > 1):
+                continue
+            rivals = ", ".join(f"{who} {n}" for who, n in votes.most_common() if who != ch["source_id"])
+            drop_with_dependents(ch, ref, f"в отрывках это {ch['id']} {own} из {known} понятных"
+                                 + (f" (ещё: {rivals})" if rivals else ""))
     # A bare surname shared by independently named relatives is also ambiguous.
     # This does not reassign the surname: it preserves their full, distinct names.
     for ch in characters:
         for ref in list(ch["candidates"]):
             candidate = candidates[ref]
+            if (ch["source_id"], ref) in labels or ref not in ch["candidates"]:
+                continue
             if candidate["kind"] != "name" or len(candidate["key"].split()) != 1 or not candidate.get("roles", {}).get("Surn"):
                 continue
             relatives = [x for x in own_ids if candidates[x]["kind"] == "name"
                          and len(candidates[x]["key"].split()) > 1
                          and candidates[x]["key"].split()[-1] == candidate["key"]
                          and used.get(x, "other") != ch["id"]]
-            if relatives:
-                was_anchor = ch["candidates"][0] == ref
-                ch["candidates"].remove(ref)
-                used[ref] = "other"
-                dropped.append(f"{ref} {candidate['display']} → прочие: фамилия встречается в других полных именах")
-                if was_anchor:
-                    for dependent in ch["candidates"]:
-                        used[dependent] = "other"
-                        dropped.append(f"{dependent} {candidates[dependent]['display']} → прочие: склейка зависит от неоднозначной фамилии {ref}")
-                    ch["candidates"] = []
+            if not relatives:
+                continue
+            # «Рогожин» 26 раз, отец «Семен Парфенович Рогожин» — 2: фамилия остаётся у Парфена.
+            # «Иволгин» у отца и сына, оба часто названы полностью — фамилия неоднозначна.
+            rival = sum(candidates[x]["count"] for x in relatives)
+            if candidate["count"] >= DOMINANCE * (candidate["count"] + rival):
+                continue
+            drop_with_dependents(ch, ref, f"фамилия встречается в других полных именах ({rival} упоминаний против {candidate['count']})")
     # Any named candidate can contradict a title, even if the LLM omitted that person.
     for ch in characters:
         for ref in [ref for ref in ch["candidates"] if candidates[ref]["kind"] == "title"]:
+            if (ch["source_id"], ref) in labels:
+                continue
             word = candidates[ref]["key"]
             per = {other["id"]: sum(candidates[x]["titles"].get(word, 0) for x in other["candidates"] if x != ref) for other in characters}
             unassigned = sum(candidates[x]["titles"].get(word, 0) for x in own_ids
@@ -1290,7 +1637,15 @@ def apply(args) -> None:
         verdicts = verification_verdicts(checked, answer, r, candidates)
         if verdicts is None and answer and any(len(ch.get("candidates", [])) > 1 for ch in answer.get("characters", [])):
             verdicts = {}  # склейки без второй проверки не принимаются
-        casts.append(build_cast(r, answer, verdicts, candidates, r["name"] + "." if collection else ""))
+        labels = {}
+        for raw_id, ref in label_targets(r, answer, candidates):
+            name = os.path.join(args.dir, "answers", f"{r['name']}.label.{ref}")
+            prompt = label_prompt(r, answer, candidates, ref, collection)
+            if metadata_matches(load_answer(name + ".meta.json"), prompt, args.dir):
+                votes = label_votes(load_answer(name + ".json"), len(candidates[ref]["contexts"]))
+                if votes is not None:
+                    labels[(raw_id, ref)] = votes
+        casts.append(build_cast(r, answer, verdicts, candidates, r["name"] + "." if collection else "", labels))
     section_cast = {sid: i for i, cast in enumerate(casts) for sid in cast["sections"]}
     save(args.dir, "cast.json", {
         "book": data["book"], "scope": request["scope"], "input_sha256": artifact_identity(args.dir), "narrator": "author", "others": "other",
@@ -1445,7 +1800,7 @@ def process(args) -> None:
     extract(Namespace(book=args.book, out=out, scope=args.scope, min_count=2, max_candidates=200, show=8, show_requests=5))
     step(f"2/5 Сопоставление в LLM ({args.provider})")
     llm(Namespace(dir=out, provider=args.provider, model=args.model, endpoint=args.endpoint, parallel=args.parallel,
-                  redo=args.redo, timeout=args.timeout, max_tokens=args.max_tokens, think=args.think))
+                  redo=args.redo, timeout=args.timeout, max_tokens=args.max_tokens, think=args.think, votes=args.votes))
     step("3/5 Проверка ответа")
     apply(Namespace(dir=out, show=12, show_casts=3))
     step("4/5 Голоса")
@@ -1463,6 +1818,7 @@ def add_llm_options(parser) -> None:
     parser.add_argument("--parallel", type=int, default=1, help="одновременных запросов (по умолчанию по одному)")
     parser.add_argument("--redo", action="store_true", help="спросить заново и те разделы, на которые ответ уже есть")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--votes", type=int, default=3, help="независимых основных ответов LLM, склейка — по большинству (по умолчанию 3)")
     parser.add_argument("--max-tokens", type=int, help="предел ответа: 16000, с --think 80000 (размышление входит в предел)")
     # Thinking improves recall in our samples but is not a correctness guarantee.
     parser.add_argument("--no-think", dest="think", action="store_false", help="выключить размышление (по умолчанию включено)")

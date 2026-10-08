@@ -1,3 +1,4 @@
+import collections
 import contextlib
 import copy
 import io
@@ -134,21 +135,86 @@ class CastTests(unittest.TestCase):
         self.c["c1"] = candidate("иволгин",count=20)
         self.c["c1"]["roles"] = {"Surn":20}
         self.c["c2"] = candidate("ардалион александрович")
-        self.c["c3"] = candidate("гаврила ардалионович иволгин")
+        self.c["c3"] = candidate("гаврила ардалионович иволгин", count=10)
         result = self.cast([character("father",["c1","c2"]),character("son",["c3"])],
                            checks=[dict(character="father",anchor="c2",candidate="c1",verdict="same")])
         self.assertEqual(["c2"], result["characters"][0]["candidates"])
         self.assertIn("c1",{x["candidate"] for x in result["other"]})
 
+    def test_surname_of_rarely_named_relative_stays_with_main_character(self):
+        # «Рогожин» 26 раз; отец «Семен Парфенович Рогожин» назван полностью дважды.
+        self.c["c1"] = candidate("рогожин", count=26)
+        self.c["c1"]["roles"] = {"Surn": 26}
+        self.c["c2"] = candidate("парфен")
+        self.c["c3"] = candidate("семен парфенович рогожин", count=2)
+        result = self.cast([character("son", ["c1", "c2"]), character("father", ["c3"])],
+                           checks=[dict(character="son", anchor="c2", candidate="c1", verdict="same")])
+        self.assertIn("c1", result["characters"][0]["candidates"])
+
     def test_ambiguous_surname_anchor_cannot_join_other_aliases(self):
         self.c["c1"] = candidate("иволгин",count=20)
         self.c["c1"]["roles"] = {"Surn":20}
         self.c["c2"] = candidate("ардалион",count=2)
-        self.c["c3"] = candidate("гаврила ардалионович иволгин")
+        self.c["c3"] = candidate("гаврила ардалионович иволгин", count=10)
         result = self.cast([character("father",["c1","c2"]),character("son",["c3"])],
                            checks=[dict(character="father",anchor="c1",candidate="c2",verdict="same")])
         self.assertEqual(["son"],[c["id"] for c in result["characters"]])
         self.assertTrue({"c1","c2"}<={x["candidate"] for x in result["other"]})
+
+
+    def test_unsure_merge_accepted_when_short_name_is_part_of_full_name(self):
+        result = self.cast([character("n", ["c1", "c2"])], checks=[dict(character="n", anchor="c2", candidate="c1", verdict="unsure")])
+        self.assertEqual(["c2", "c1"], result["characters"][0]["candidates"])
+
+    def test_unsure_merge_rejected_when_short_name_fits_another_person(self):
+        self.c["c3"] = candidate("николай андреевич")
+        result = self.cast([character("n", ["c1", "c2"])], checks=[dict(character="n", anchor="c2", candidate="c1", verdict="unsure")])
+        self.assertEqual(["c2"], result["characters"][0]["candidates"])
+
+    def test_different_verdict_always_rejects_merge(self):
+        result = self.cast([character("n", ["c1", "c2"])], checks=[dict(character="n", anchor="c2", candidate="c1", verdict="different")])
+        self.assertEqual(["c2"], result["characters"][0]["candidates"])
+
+    def label_cast(self, votes):
+        self.c["c4"]["contexts"] = ["…"] * sum(votes.values())
+        a = dict(characters=[character("n", ["c2", "c4"]), character("p", ["c3"])], other=[])
+        v = {("n", "c2", "c4"): "same"}
+        return b.build_cast(self.r, a, v, self.c, "", {("n", "c4"): collections.Counter(votes)})
+
+    def test_title_kept_when_passages_mostly_name_owner(self):
+        # «генерал» иногда называет другого человека, но почти везде — этого.
+        self.c["c3"]["titles"] = {"генерал": 3}
+        result = self.label_cast({"n": 14, "p": 1, "unsure": 1})
+        self.assertIn("c4", result["characters"][0]["candidates"])
+
+    def test_title_dropped_when_passages_split_between_people(self):
+        result = self.label_cast({"n": 9, "p": 6, "unsure": 1})
+        self.assertNotIn("c4", result["characters"][0]["candidates"])
+        self.assertIn("c4", {x["candidate"] for x in result["other"]})
+
+    def test_title_dropped_when_passages_mostly_unclear(self):
+        result = self.label_cast({"n": 3, "unsure": 13})
+        self.assertNotIn("c4", result["characters"][0]["candidates"])
+
+
+class CombineTests(unittest.TestCase):
+    def setUp(self):
+        self.c = {f"c{n}": candidate(f"имя{n}", count=10 - n) for n in range(1, 6)}
+        self.r = dict(candidates=list(self.c))
+
+    def test_majority_keeps_merge_and_drops_single_run_mistake(self):
+        runs = [{"characters": [character("a", ["c1", "c2"]), character("b", ["c3"])], "other": ["c4", "c5"]},
+                {"characters": [character("a", ["c1", "c2", "c3"])], "other": ["c4", "c5"]},
+                {"characters": [character("a", ["c1", "c2"]), character("b", ["c3", "c4"])], "other": ["c5"]}]
+        combined = b.combine_answers(runs, self.r, self.c)
+        groups = {ch["id"]: ch["candidates"] for ch in combined["characters"]}
+        self.assertEqual({"a": ["c1", "c2"], "b": ["c3"]}, groups)
+        self.assertEqual(["c4", "c5"], combined["other"])
+
+    def test_identifiers_are_unique(self):
+        runs = [{"characters": [character("a", ["c1"]), character("a", ["c2"])], "other": []}] * 3
+        ids = [ch["id"] for ch in b.combine_answers(runs, self.r, self.c)["characters"]]
+        self.assertEqual(len(ids), len(set(ids)))
 
 
 class ExtractorTests(unittest.TestCase):
@@ -161,6 +227,41 @@ class ExtractorTests(unittest.TestCase):
         self.assertIn((0, "епанчина"), c)
         self.assertEqual("m", b.gender_of(c[(0, "епанчин")]))
         self.assertEqual("f", b.gender_of(c[(0, "епанчина")]))
+
+    def test_singular_ov_surname_is_a_person_not_a_family(self):
+        c = self.extract(["Начинающий дизайнер Улямов боялся. Улямов взмахнул рукой. Мысль пришла Улямову."])
+        self.assertEqual("name", c[(0, "улямов")].kind)
+        self.assertEqual(3, c[(0, "улямов")].count)
+
+    def test_plural_unknown_surname_is_a_family(self):
+        c = self.extract(["Супруги Бобриковы пришли. Он встретил Бобриковых. Рядом с Бобриковыми."])
+        self.assertEqual("family", c[(0, "семья бобриков")].kind)
+
+    def test_diminutive_forms_join_most_frequent_base(self):
+        text = ["Владя спал. Владя ел. Владя пил. Владя шёл.", "Пришёл Кирюха. Ушёл Кирюха. Сел Кирюха.",
+                "Он позвал Владю. Он видел Кирюху. — Кирюх, иди! — Кирюх, стой!"]
+        c = self.extract(text)
+        self.assertEqual(5, c[(0, "владя")].count)
+        self.assertEqual(4, c[(0, "кирюха")].count)
+
+    def test_two_surnames_in_a_row_are_two_people(self):
+        c = self.extract(["Рогожин пришёл. Рогожин ушёл.", "— А ты ступай за мной, строка, — сказал Рогожин Лебедеву."])
+        self.assertNotIn((0, "рогожин лебедев"), c)
+        self.assertEqual(1, c[(0, "рогожин")].speaker)
+
+    def test_parenthetical_word_between_verb_and_speaker(self):
+        c = self.extract(["Рогожин пришёл.", "— Эге! — действительно удивился, наконец, Рогожин; — да ведь он знает."])
+        self.assertEqual(1, c[(0, "рогожин")].speaker)
+
+    def test_descriptor_speaker_becomes_candidate(self):
+        c = self.extract(["— Зябко? — спросил черномазый.", "— Куда же? — спросил черномазый.", "— Гм… — промычал удивленный лакей."])
+        self.assertEqual(2, c[(0, "черномазый")].speaker)
+        self.assertTrue(c[(0, "черномазый")].descriptor)
+        self.assertEqual(1, c[(0, "лакей")].speaker)
+
+    def test_plural_title_is_not_a_person(self):
+        c = self.extract(["— Господа, — сказал он. Господа молчали."])
+        self.assertNotIn((0, "господин"), c)
 
     def test_inflected_titles_are_detected(self):
         c = self.extract(["Он спросил князя. Потом он подошёл к князю и говорил с князем."])
@@ -317,6 +418,33 @@ class ResumeTests(unittest.TestCase):
     def run_llm(self, chat=None):
         with patch.dict(os.environ, {"OLLAMA_API_KEY":"not-a-real-key"}), patch.object(b, "load_env"), patch.object(b, "request_chat", side_effect=chat or self.chat), contextlib.redirect_stdout(io.StringIO()):
             b.llm(self.args)
+
+    def test_votes_and_label_checks_are_cached_and_applied(self):
+        self.candidates["c3"] = candidate("генерал", "title", source="Title", count=5)
+        self.candidates["c3"]["contexts"] = ["[[генерал]] вошёл"] * 4
+        self.r["candidates"] = list(self.candidates)
+        b.save(str(self.folder), "candidates.json", {"book": "Fixture", "sections": [{"id": "s1", "title": "Test"}],
+                                                      "candidates": [dict(c,id=k) for k,c in self.candidates.items()]})
+        b.save(str(self.folder), "llm_request.json", {"scope":"book", "requests":[self.r]})
+        self.answer = {"characters":[character("n",["c1","c2","c3"])],"other":[]}
+        self.checks = {"checks":[dict(character="n", anchor="c2", candidate="c1", verdict="same"),
+                                 dict(character="n", anchor="c2", candidate="c3", verdict="same")]}
+        base = self.chat
+        def chat(*args):
+            if args[4].startswith("Кто назван"):
+                self.calls.append(args[4])
+                reply = {"answers": [{"n": n, "who": "n"} for n in range(1, 5)]}
+                return dict(content=json.dumps(reply), thinking_chars=1, done_reason="stop", prompt_tokens=1, output_tokens=1)
+            return base(*args)
+        self.args.votes = 3
+        self.run_llm(chat)
+        self.assertEqual(5, len(self.calls))  # 3 основных, 1 по отрывкам, 1 проверка склеек
+        self.calls.clear(); self.run_llm(chat)
+        self.assertEqual([], self.calls)
+        with contextlib.redirect_stdout(io.StringIO()):
+            b.apply(Namespace(dir=str(self.folder), show=0, show_casts=0))
+        cast = b.read_json(str(self.folder/"cast.json"))["casts"][0]
+        self.assertEqual(["c2", "c1", "c3"], cast["characters"][0]["candidates"])
 
     def test_resume_missing_verification_only(self):
         self.run_llm(); self.assertEqual(2,len(self.calls))
