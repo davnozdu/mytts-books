@@ -1,0 +1,7 @@
+.env
+venv/
+.venv/
+out/
+__pycache__/
+*.pyc
+*.mytts-book
