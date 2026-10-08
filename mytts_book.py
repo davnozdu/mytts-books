@@ -225,6 +225,7 @@ class Extractor:
         self.capitalized: collections.Counter = collections.Counter()
         self.lower: collections.Counter = collections.Counter()
         self.capital_inside: collections.Counter = collections.Counter()
+        self.normal_inside: collections.Counter = collections.Counter()
 
     def named(self, word: str) -> list:
         """Разборы как имени/фамилии/отчества в единственном числе («Рогожину» — фамилия, не «рогожина»)."""
@@ -248,6 +249,7 @@ class Extractor:
                     self.capitalized[k] += 1
                     if not sentence_start(text, m.start()):
                         self.capital_inside[k] += 1
+                        self.normal_inside[self.first(w).normal_form.replace("ё", "е")] += 1
 
     def is_name(self, word: str, at_start: bool) -> bool:
         k = word.lower().replace("ё", "е")
@@ -266,8 +268,9 @@ class Extractor:
         if self.lower[k] > self.capital_inside[k]:  # нарицательное, просто в начале предложения
             return False
         if at_start:
-            return self.capital_inside[k] > 0 or (tagged and self.lower[k] == 0)
-        return tagged or self.capital_inside[k] >= 2
+            return self.capital_inside[k] > 0 or (tagged and self.lower[k] == 0) or (
+                self.normal_inside[self.first(word).normal_form.replace("ё", "е")] >= 2 and self.lower[k] == 0)
+        return tagged or (self.capital_inside[k] >= 1 and self.lower[k] == 0)
 
     POSSESSIVE = re.compile(r"^(.{2,}?)[иы]н(?:а|о|ы|ой|ою|ому|ым|ом|ых|ыми|у|е)?$")
 
@@ -280,10 +283,12 @@ class Extractor:
         owner = max(self.capitalized[m.group(1) + "а"], self.capitalized[m.group(1) + "я"])
         return owner >= max(5, 3 * self.capitalized[k])
 
-    def chain_key(self, words: list[str]) -> tuple[str, list, bool, bool]:
+    def chain_key(self, words: list[str], expected_gender: str | None = None) -> tuple[str, list, bool, bool]:
         """Ключ цепочки «Евгения Павловича» → «евгений павлович»: падеж и род согласуются по всем словам.
         Возвращает (ключ, [(род, роль)], семья, именительный падеж)."""
         options = [[p for p in self.named(w) if "sing" in p.tag.grammemes or "Sgtm" in p.tag.grammemes] for w in words]
+        if expected_gender:
+            options = [[p for p in opt if p.tag.gender == expected_gender] or opt for opt in options]
         family = any(self.named(w) and not opt for w, opt in zip(words, options))
         shared = None
         for opt in options:
@@ -300,7 +305,11 @@ class Extractor:
                     keys.append(parses[0].normal_form.replace("ё", "е"))
                     info.append((None, next(r for r in ("Name", "Patr", "Surn") if r in parses[0].tag.grammemes)))
                 else:  # нет в словаре: «Рогожина», «Фердыщенка» → форма, которая сама встречается в книге
-                    keys.append(self.unknown_base(low))
+                    adjective = self.first(w)
+                    base = self.unknown_base(low)
+                    if adjective.tag.POS == "ADJF" and adjective.normal_form.endswith(("ский", "цкий", "ской", "цкой")):
+                        base = adjective.normal_form.replace("ё", "е")
+                    keys.append(base)
                     info.append((None, None))
                     nominative = nominative and keys[-1] == low
                 continue
@@ -314,7 +323,7 @@ class Extractor:
             # Одна форма — разные слова («Лебедева»: его или она; «Александра»): чаще встречающаяся в книге.
             # Словарь может не знать уменьшительного («Кирюху» → «кирюх»): тогда форма, которая есть в книге.
             fallback = self.unknown_base(low)
-            if fallback not in forms and all(self.capitalized[f] == 0 for f in forms) and self.capitalized[fallback] > 0:
+            if fallback != low and fallback not in forms and all(self.capitalized[f] == 0 for f in forms) and self.capitalized[fallback] > 0:
                 forms[fallback] = forms[max(forms, key=lambda f: self.capitalized[f])]
             key = max(forms, key=lambda f: (self.capitalized[f], f == low))
             chosen = forms[key][0]
@@ -325,6 +334,15 @@ class Extractor:
         return " ".join(keys), info, family, nominative
 
     def unknown_base(self, low: str) -> str:
+        # Adjectival surnames absent from the dictionary: «Тоцким» → «Тоцкий»,
+        # only when that nominative form actually occurs in the same text.
+        for ending in ("ого", "ому", "ыми", "ых", "им", "ым", "ом"):
+            if low.endswith(ending):
+                stem = low[:-len(ending)]
+                for suffix in ("ий", "ый", "ой"):
+                    base = stem + suffix
+                    if len(stem) >= 3 and self.capitalized[base] >= max(2, self.capitalized[low] // 4):
+                        return base
         for ending in CASE_ENDINGS:
             if low.endswith(ending) and len(low) - len(ending) >= 3:
                 stem = low[: -len(ending)]
@@ -342,7 +360,7 @@ class Extractor:
             cand = candidates.get((scope, key)) or candidates.setdefault((scope, key), Candidate(key, kind, scope))
             cand.count += 1
             cand.sections[section] += 1
-            if len(cand.examples) < 3 and (not cand.examples or cand.count in (5, 40)):
+            if len(cand.examples) < 6 and (cand.count <= 3 or cand.count in (10, 40, 100)):
                 cand.examples.append(snippet(text, start, end))
             return cand
 
@@ -354,8 +372,8 @@ class Extractor:
                 m = words[i]
                 low = m.group().lower()
                 title = None
-                if low in TITLES:
-                    parsed = self.first(low)
+                parsed = self.first(low)
+                if parsed.normal_form in TITLES:
                     title = parsed.normal_form
                     j = i + 1
                     if j < len(words) and text[m.end():words[j].start()] == " " and self.is_name(words[j].group(), False):
@@ -377,7 +395,8 @@ class Extractor:
                 while i + 1 < len(words) and text[run[-1].end():words[i + 1].start()] == " " and self.is_name(words[i + 1].group(), False):
                     i += 1
                     run.append(words[i])
-                key, info, family, nominative = self.chain_key([x.group() for x in run])
+                key, info, family, nominative = self.chain_key([x.group() for x in run],
+                    parsed.tag.gender if title else None)
                 cand = add(("семья " + key) if family else key, "family" if family else "name", section, text, run[0].start(), run[-1].end())
                 cand.forms[text[run[0].start():run[-1].end()]] += 1
                 for gender, role in info:
@@ -387,8 +406,24 @@ class Extractor:
                             cand.genders[f"{role}:{gender}"] += 1
                 if title:
                     cand.titles[title] += 1
+                    if parsed.tag.gender in ("masc", "femn"):
+                        cand.genders["Title:" + ("f" if parsed.tag.gender == "femn" else "m")] += 1
                 mentions.append(Mention(run[0].start(), run[-1].end(), cand, nominative))
                 i += 1
+            # Apposition also identifies titles: «Иван Петрович, отставной генерал».
+            # Otherwise a title belonging to two people can look unique from prefixes alone.
+            for mention in mentions:
+                if mention.cand.kind != "title":
+                    continue
+                previous = [m for m in mentions if m.cand.kind == "name" and m.end < mention.start]
+                if not previous:
+                    continue
+                name = previous[-1]
+                gap = text[name.end:mention.start]
+                if len(gap) <= 64 and re.fullmatch(r"\s*,\s*(?:[А-ЯЁа-яё-]+\s+){0,3}", gap):
+                    qualifiers = [self.first(w.group()) for w in WORD.finditer(gap)]
+                    if all(q.tag.POS in ("ADJF", "PRTF", "ADVB") for q in qualifiers):
+                        name.cand.titles[mention.cand.key] += 1
             self.attribute_speakers(text, mentions)
             present = {id(x.cand): x.cand for x in mentions}
             for a in present.values():
@@ -502,7 +537,8 @@ VERIFY = """Проверка сопоставления персонажей в 
 Для каждого остального кандидата ответь, тот ли это человек, что и главный:
 "same" — несомненно тот же человек; "different" — другой человек или не человек; "unsure" — нельзя
 уверенно сказать по примерам. Сомнение — это "unsure". Ответ — только JSON без пояснений:
-{{"checks": [{{"candidate": "{p}5", "verdict": "same"}}]}}
+{{"checks": [{{"character": "id персонажа", "anchor": "{p}1", "candidate": "{p}5", "verdict": "same"}}]}}
+В каждом checks повтори id персонажа и номер главного кандидата из группы. Проверяй по примерам, не по памяти о книге.
 
 {groups}
 """
@@ -533,12 +569,12 @@ def candidate_line(cid: str, c: Candidate, ids: dict) -> str:
     if roles:
         bits.append("+".join({"Name": "имя", "Patr": "отчество", "Surn": "фамилия"}[r] for r in roles))
     if c.titles:
-        bits.append("перед ним: " + ", ".join(t for t, _ in c.titles.most_common(3)))
+        bits.append("обращения при имени: " + ", ".join(t for t, _ in c.titles.most_common(3)))
     near = [ids[(c.scope, k)] for k, _ in c.together.most_common(8) if (c.scope, k) in ids][:4]
     if near:
         bits.append("рядом: " + ", ".join(near))
     line = " | ".join(bits)
-    for e in c.examples[: 1 if c.count < 30 else 2]:
+    for e in c.examples[:3]:
         line += f"\n    пример: {e}"
     return line
 
@@ -553,7 +589,7 @@ def extract(args) -> None:
         found = Extractor().run(book, per_section=True)
     groups: dict[int, list] = collections.defaultdict(list)
     for c in found.values():
-        if c.count >= args.min_count or c.speaker > 0:
+        if c.count >= args.min_count or c.speaker > 0 or (c.kind == "name" and (c.roles.get("Name") or c.roles.get("Patr"))):
             groups[c.scope].append(c)
     os.makedirs(args.out, exist_ok=True)
     ids, records, requests = {}, [], []
@@ -611,9 +647,22 @@ def extract(args) -> None:
             f"{by_id[c]['display']}({by_id[c]['count']},{by_id[c]['gender']})" for c in r["candidates"][: args.show]))
 
 
-def save(folder: str, name: str, data) -> None:
-    with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
+def read_json(path: str):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save(folder: str, name: str, data, compact: bool = False) -> None:
+    import tempfile
+    target = os.path.join(folder, name)
+    fd, temp = tempfile.mkstemp(prefix=".mytts-", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, **({"separators": (",", ":")} if compact else {"indent": 1}))
+        os.replace(temp, target)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 
 # ---------------------------------------------------------------- LLM: Ollama Cloud или API DeepSeek
@@ -633,10 +682,11 @@ MAX_TOKENS = {
 class LLMError(RuntimeError):
     """Ошибка сервиса LLM: код HTTP, текст ответа и (для 429) сколько секунд ждать до повтора."""
 
-    def __init__(self, status: int, message: str, retry_after: str | None = None) -> None:
+    def __init__(self, status: int, message: str, retry_after: str | None = None, max_output_tokens: int | None = None) -> None:
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.retry_after = retry_after
+        self.max_output_tokens = max_output_tokens
 
     def wait_seconds(self, default: float) -> float:
         """Сколько ждать до повтора: заголовок Retry-After сервиса (не больше двух минут), иначе заданное."""
@@ -661,6 +711,47 @@ def load_env() -> None:
                 os.environ.setdefault(name.strip(), value.strip().strip("\"'"))
 
 
+_THINKING_CONTROLS: dict[tuple, list] = {}
+_MODEL_LIMITS: dict[tuple, int] = {}
+
+
+def thinking_control(values: list, enabled: bool):
+    if values == [False]:
+        return False
+    if values == [True]:
+        return True
+    if any(v is enabled for v in values):
+        return enabled
+    levels = [v for v in values if isinstance(v, str)]
+    order = ("high", "max", "medium", "low", "minimal") if enabled else ("minimal", "low", "medium", "high", "max")
+    if levels:
+        return next((v for v in order if v in levels), levels[0])
+    return enabled
+
+
+def ollama_thinking(endpoint: str, model: str, key: str, enabled: bool):
+    cache_key = (endpoint.rstrip("/"), model)
+    if cache_key not in _THINKING_CONTROLS:
+        req = urllib.request.Request(endpoint.rstrip("/") + "/api/show", data=json.dumps({"model":model}).encode(),
+            headers={"Content-Type":"application/json", "Authorization":"Bearer " + key})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.load(response)
+            thinking = data.get("thinking")
+            values = thinking.get("values") if isinstance(thinking, dict) else None
+            _THINKING_CONTROLS[cache_key] = values if isinstance(values, list) else []
+        except urllib.error.HTTPError as e:
+            status = e.code
+            e.close()
+            if status not in (404, 405):
+                raise LLMError(status, "сервер отклонил сведения о модели") from None
+            _THINKING_CONTROLS[cache_key] = []
+    values = _THINKING_CONTROLS[cache_key]
+    if enabled and values and thinking_control(values, True) is False:
+        raise ValueError("Выбранная модель не поддерживает размышление")
+    return thinking_control(values, enabled)
+
+
 def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str, think: bool, max_tokens: int, timeout: int) -> dict:
     """Один запрос. Возвращает content, thinking (длина), причину остановки и токены в общем виде."""
     if provider == "deepseek":
@@ -673,7 +764,7 @@ def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str
             body["reasoning_effort"] = "high"
     else:
         url = endpoint.rstrip("/") + "/api/chat"
-        body = {"model": model, "stream": False, "think": think, "options": {"temperature": 0, "num_predict": max_tokens},
+        body = {"model": model, "stream": False, "think": ollama_thinking(endpoint, model, key, think), "options": {"temperature": 0, "num_predict": max_tokens},
                 "messages": [{"role": "user", "content": prompt}]}
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
@@ -682,7 +773,16 @@ def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str
             data = json.loads(response.read())
     except urllib.error.HTTPError as e:  # текст ошибки сервиса, без ключа
         retry = e.headers.get("retry-after") if e.headers else None
-        raise LLMError(e.code, e.read().decode("utf-8", "replace")[:300], retry) from None
+        # Keep only the numeric limit; never retain/log arbitrary response bodies.
+        try:
+            message = json.loads(e.read()).get("error", "")
+            match = re.search(r"maximum output tokens \((\d+)\)", message) if isinstance(message, str) else None
+            cap = int(match.group(1)) if match else None
+        except (ValueError, TypeError):
+            cap = None
+        finally:
+            e.close()
+        raise LLMError(e.code, "сервер отклонил запрос", retry, cap) from None
     if provider == "deepseek":
         choice = data["choices"][0]
         message = choice.get("message", {})
@@ -693,7 +793,7 @@ def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str
                 "output_tokens": usage.get("completion_tokens")}
     message = data.get("message", {})
     return {"content": message.get("content", ""), "thinking_chars": len(message.get("thinking") or ""),
-            "done_reason": data.get("done_reason"), "prompt_tokens": data.get("prompt_eval_count"),
+            "thinking_control": body["think"], "done_reason": data.get("done_reason"), "prompt_tokens": data.get("prompt_eval_count"),
             "output_tokens": data.get("eval_count")}
 
 
@@ -705,54 +805,99 @@ def llm(args) -> None:
     key = os.environ.get(preset["key"], "")
     if not key:
         sys.exit(f"Нет ключа: задайте {preset['key']} в переменной окружения или в файле .env (см. README.md)")
-    request = json.load(open(os.path.join(args.dir, "llm_request.json"), encoding="utf-8"))
-    by_id = {c["id"]: c for c in json.load(open(os.path.join(args.dir, "candidates.json"), encoding="utf-8"))["candidates"]}
+    request = read_json(os.path.join(args.dir, "llm_request.json"))
+    by_id = {c["id"]: c for c in read_json(os.path.join(args.dir, "candidates.json"))["candidates"]}
     folder = os.path.join(args.dir, "answers")
     os.makedirs(folder, exist_ok=True)
 
-    def chat(prompt: str, name: str) -> str:
-        """Один запрос; ответ в answers/NAME.json, служебные поля (причина остановки, токены) — в NAME.meta.json.
-        Размышление по умолчанию включено (--no-think выключает): точнее, роман ~3 мин вместо секунд.
-        Лимит провайдера (429) — ждём Retry-After и повторяем; пустой ответ (токены ушли на размышление) — тоже."""
-        limit = args.max_tokens or MAX_TOKENS.get(args.provider, MAX_TOKENS["ollama"])["think" if args.think else "plain"]
+    input_sha = artifact_identity(args.dir)
+
+    def identity(prompt: str) -> str:
+        return cache_fingerprint(args.provider, args.endpoint, args.model, args.think, prompt,
+                                 args.max_tokens or MAX_TOKENS[args.provider]["think" if args.think else "plain"], input_sha)
+
+    def cached(prompt: str, name: str, verify: bool = False) -> bool:
+        if args.redo:
+            return False
+        answer = load_answer(os.path.join(folder, name + ".json"))
+        meta = load_answer(os.path.join(folder, name + ".meta.json"))
+        return bool(valid_response(answer, verify) and meta and meta.get("request_sha256") == identity(prompt)
+                    and meta.get("done_reason") != "length")
+
+    def chat(prompt: str, name: str, verify: bool = False) -> str:
+        requested_limit = args.max_tokens or MAX_TOKENS[args.provider]["think" if args.think else "plain"]
+        model_key = (args.provider, args.endpoint, args.model)
+        limit = min(requested_limit, _MODEL_LIMITS.get(model_key, requested_limit))
         delay = 2.0
         for attempt in range(1, 4):
             started = time.time()
             try:
                 reply = request_chat(args.provider, args.endpoint, args.model, key, prompt, args.think, limit, args.timeout)
             except LLMError as e:
+                if attempt < 3 and e.status == 400 and e.max_output_tokens and 0 < e.max_output_tokens < limit:
+                    limit = e.max_output_tokens
+                    _MODEL_LIMITS[model_key] = limit
+                    print(f"  [{name}] API ограничивает ответ {limit} токенами; повторяем с допустимым пределом", flush=True)
+                    continue
                 if attempt >= 3 or e.status not in (429, 500, 502, 503, 504):
                     raise
                 delay = e.wait_seconds(delay * 2)
-                print(f"  [{name}] {e}; ждём {delay:.0f} с и повторяем ({attempt + 1}/3)", flush=True)
+                print(f"  [{name}] HTTP {e.status}; ждём {delay:.0f} с и повторяем ({attempt + 1}/3)", flush=True)
                 time.sleep(delay)
                 continue
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if attempt >= 3:
+                    raise
+                print(f"  [{name}] временный сетевой сбой {type(e).__name__}; ждём {delay:.0f} с и повторяем ({attempt + 1}/3)", flush=True)
+                time.sleep(delay)
+                delay = min(120, delay * 2)
+                continue
             content = reply.pop("content")
+            answer = parse_answer(content)
+            if reply.get("done_reason") == "length" or not valid_response(answer, verify):
+                if attempt < 3:
+                    print(f"  [{name}] неполный или некорректный ответ; повторяем ({attempt + 1}/3)", flush=True)
+                    continue
+                raise ValueError("LLM не вернула полный JSON нужного формата; ответ не сохранён")
             meta = dict(reply, provider=args.provider, model=args.model, content_chars=len(content),
+                        request_sha256=identity(prompt), thinking=args.think, endpoint=args.endpoint, max_tokens=requested_limit, effective_max_tokens=limit, input_sha256=input_sha,
                         seconds=round(time.time() - started, 1), attempt=attempt)
+            # Never expose a partly written reply as a completed cache entry.
+            save(folder, name + ".json", answer)
             save(folder, name + ".meta.json", meta)
-            with open(os.path.join(folder, name + ".json"), "w", encoding="utf-8") as f:
-                f.write(content)
-            if content.strip() or attempt >= 3:
-                break
-        return (f"{meta['seconds']} с, ответ {meta['content_chars']} знаков, размышление {meta['thinking_chars']}, "
-                f"токенов {meta['prompt_tokens']}→{meta['output_tokens']}, {meta['done_reason']}")
+            return (f"{meta['seconds']} с, ответ {meta['content_chars']} знаков, размышление {meta['thinking_chars']}, "
+                    f"токенов {meta['prompt_tokens']}→{meta['output_tokens']}, {meta['done_reason']}")
+        raise RuntimeError("Не удалось получить ответ LLM")
 
     def ask(r: dict) -> str:
-        line = chat(r["prompt"], r["name"])
-        answer = load_answer(os.path.join(folder, r["name"] + ".json"))
+        name = r["name"]
+        line = "основной ответ из кэша" if cached(r["prompt"], name) else chat(r["prompt"], name)
+        answer = load_answer(os.path.join(folder, name + ".json"))
         prompt = verify_prompt(r, answer, by_id, request["scope"] == "section") if answer else None
         if not prompt:
             return line + "; проверять нечего"
-        return line + "; проверка: " + chat(prompt, r["name"] + ".verify")
+        verification = "из кэша" if cached(prompt, name + ".verify", True) else chat(prompt, name + ".verify", True)
+        checked = load_answer(os.path.join(folder, name + ".verify.json"))
+        if not verification_complete(checked, answer, r, by_id):
+            # A well-formed JSON may still omit/repeat a check or name the wrong anchor.
+            # Do not cache that as a complete verification, nor report a successful export.
+            if os.path.exists(os.path.join(folder, name + ".verify.meta.json")):
+                os.unlink(os.path.join(folder, name + ".verify.meta.json"))
+            raise ValueError("Проверка склеек неполна или относится к другой группе; повторите запуск")
+        return line + "; проверка: " + verification
 
     started = time.time()
-    todo = [r for r in request["requests"] if args.redo or load_answer(os.path.join(folder, r["name"] + ".json")) is None]
-    print(f"Запросов {len(todo)} из {len(request['requests'])} (остальные уже есть), {args.provider}: {args.model}, "
-          f"размышление {'вкл' if args.think else 'выкл'}, одновременно {args.parallel}", flush=True)
+    todo = request["requests"]
+    print(f"Разделов {len(todo)}, {args.provider}: {args.model}, "
+          f"размышление {'вкл' if args.think else 'выкл'}, одновременно {args.parallel}; готовый кэш переиспользуется", flush=True)
+    failures = []
     with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
         for r, line in zip(todo, pool.map(lambda r: safe(ask, r), todo)):
             print(f"  [{r['name']}] {r['title']}: {line}", flush=True)
+            if line.startswith("ошибка:"):
+                failures.append(r["name"])
+    if failures:
+        raise RuntimeError("Не завершены запросы LLM: " + ", ".join(failures) + ". Повторите запуск; готовые ответы сохранены.")
     print(f"Готово за {time.time() - started:.1f} с")
 
 
@@ -763,14 +908,69 @@ def safe(fn, r) -> str:
         return f"ошибка: {type(e).__name__}: {str(e)[:160]}"
 
 
+def character_refs(raw: dict, r: dict, candidates: dict) -> list[str]:
+    refs = raw.get("candidates", [])
+    if not isinstance(refs, list):
+        return []
+    own = set(r["candidates"])
+    refs = list(dict.fromkeys(ref for ref in refs if isinstance(ref, str) and ref in own and ref in candidates))
+    # Names anchor a merge, never a generic title/family. Most complete names first.
+    return sorted(refs, key=lambda ref: (candidates[ref]["kind"] != "name",
+        -len(candidates[ref]["key"].split()), -candidates[ref]["count"], ref))
+
+
+def verification_complete(checked: dict | None, answer: dict, r: dict, candidates: dict) -> bool:
+    if not valid_response(checked, True):
+        return False
+    expected = []
+    for raw in answer["characters"]:
+        refs = character_refs(raw, r, candidates)
+        expected.extend((raw["id"], refs[0], ref) for ref in refs[1:])
+    actual = [(check["character"], check["anchor"], check["candidate"]) for check in checked["checks"]]
+    return collections.Counter(actual) == collections.Counter(expected) and len(actual) == len(set(actual))
+
+
+def verification_verdicts(checked: dict | None, answer: dict | None, r: dict, candidates: dict) -> dict:
+    verdicts = {}
+    expected = {}
+    raw_characters = (answer or {}).get("characters", [])
+    for raw in raw_characters if isinstance(raw_characters, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        refs = character_refs(raw, r, candidates)
+        for ref in refs[1:]:
+            expected.setdefault(ref, []).append((str(raw.get("id", "")), refs[0]))
+    checks = (checked or {}).get("checks", [])
+    if not isinstance(checks, list):
+        return verdicts
+    seen = collections.Counter()
+    for check in checks:
+        if not isinstance(check, dict) or not isinstance(check.get("candidate"), str):
+            continue
+        ref = check["candidate"]
+        # Legacy unbound verdicts are intentionally not used for a new merge.
+        pair = (check.get("character"), check.get("anchor"))
+        if not all(isinstance(x, str) for x in pair):
+            continue
+        if pair not in expected.get(ref, []):
+            continue
+        key = (pair[0], pair[1], ref)
+        seen[key] += 1
+        verdicts[key] = check.get("verdict") if seen[key] == 1 else "unsure"
+    return verdicts
+
+
 def verify_prompt(r: dict, answer: dict, by_id: dict, collection: bool) -> str | None:
     """Второй запрос: каждую склейку подтверждает отдельный ответ «тот же / другой / не уверена»."""
     groups = []
-    for raw in answer.get("characters", []):
-        refs = [ref for ref in raw.get("candidates", []) if ref in by_id and ref in r["candidates"]]
+    raw_characters = answer.get("characters", [])
+    for raw in raw_characters if isinstance(raw_characters, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        refs = character_refs(raw, r, by_id)
         if len(refs) < 2:
             continue
-        lines = [f"Персонаж «{raw.get('name', '')}». Главный: {describe(by_id[refs[0]])}"]
+        lines = [f"Группа id={raw.get('id', '')}. Главный: {describe(by_id[refs[0]])}"]
         lines += [f"  проверить {describe(by_id[ref])}" for ref in refs[1:]]
         groups.append("\n".join(lines))
     if not groups:
@@ -782,21 +982,74 @@ def verify_prompt(r: dict, answer: dict, by_id: dict, collection: bool) -> str |
 
 def describe(c: dict) -> str:
     text = f"{c['id']} {c['display']} (упоминаний {c['count']}, род {c['gender']}, формы: {', '.join(list(c['forms'])[:4])})"
-    for e in c["examples"][:2]:
+    for e in c["examples"][:3]:
         text += f"\n      пример: {e}"
     return text
 
 
 # ---------------------------------------------------------------- проверка ответа
 
-def load_answer(path: str) -> dict | None:
-    if not os.path.exists(path):
-        return None
-    text = open(path, encoding="utf-8").read()
+def artifact_identity(folder: str) -> str:
+    digest = hashlib.sha256()
+    for name in ("candidates.json", "llm_request.json", "book_index.json"):
+        path = os.path.join(folder, name)
+        digest.update(name.encode())
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                digest.update(f.read())
+    return digest.hexdigest()
+
+
+def metadata_matches(meta: dict | None, prompt: str, folder: str) -> bool:
+    if not meta or not all(k in meta for k in ("provider", "endpoint", "model", "thinking", "max_tokens", "request_sha256", "input_sha256", "done_reason")):
+        return False
+    if not all(isinstance(meta[k], str) for k in ("provider", "endpoint", "model", "request_sha256", "input_sha256", "done_reason")) or not isinstance(meta["thinking"], bool) or not isinstance(meta["max_tokens"], int):
+        return False
+    source = artifact_identity(folder)
+    return meta["input_sha256"] == source and meta["done_reason"] != "length" and meta["request_sha256"] == cache_fingerprint(
+        meta["provider"], meta["endpoint"], meta["model"], meta["thinking"], prompt, meta["max_tokens"], source)
+
+
+def cache_fingerprint(provider: str, endpoint: str, model: str, think: bool, prompt: str, max_tokens: int, input_sha256: str = "") -> str:
+    return hashlib.sha256(json.dumps(["cast-verify-v2", provider, endpoint.rstrip("/"), model,
+                                     think, max_tokens, prompt, input_sha256], ensure_ascii=False).encode()).hexdigest()
+
+
+def parse_answer(text: str) -> dict | None:
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("повторный ключ JSON")
+            result[key] = value
+        return result
     start, end = text.find("{"), text.rfind("}")
     try:
-        return json.loads(text[start:end + 1]) if 0 <= start < end else None
-    except json.JSONDecodeError:
+        value = json.loads(text[start:end + 1], object_pairs_hook=unique) if 0 <= start < end else None
+        return value if isinstance(value, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def valid_response(answer: dict | None, verify: bool = False) -> bool:
+    if not isinstance(answer, dict):
+        return False
+    if verify:
+        return isinstance(answer.get("checks"), list) and all(isinstance(c, dict) and
+            all(isinstance(c.get(k), str) for k in ("character", "anchor", "candidate")) and
+            c.get("verdict") in ("same", "different", "unsure") for c in answer["checks"])
+    return isinstance(answer.get("characters"), list) and isinstance(answer.get("other"), list) and all(
+        isinstance(c, dict) and isinstance(c.get("id"), str) and isinstance(c.get("name"), str) and
+        c.get("gender") in ("m", "f", "?") and isinstance(c.get("candidates"), list) and
+        all(isinstance(ref, str) for ref in c["candidates"]) for c in answer["characters"]) and all(
+        isinstance(ref, str) for ref in answer["other"])
+
+
+def load_answer(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return parse_answer(f.read())
+    except (OSError, UnicodeError):
         return None
 
 
@@ -811,7 +1064,24 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
     if answer is None:
         problems.append("нет ответа LLM или в нём нет JSON — все кандидаты в «прочих»")
         answer = {}
-    for raw in answer.get("characters", []):
+    raw_characters = answer.get("characters", [])
+    if not isinstance(raw_characters, list):
+        raw_characters = []
+        problems.append("characters должен быть списком — все кандидаты в прочих")
+    ownership = collections.Counter(ref for raw in raw_characters if isinstance(raw, dict)
+        for ref in (raw.get("candidates", []) if isinstance(raw.get("candidates", []), list) else [])
+        if isinstance(ref, str) and ref in own_ids)
+    explicit_other = answer.get("other", [])
+    if not isinstance(explicit_other, list):
+        explicit_other = []
+    ownership.update(ref for ref in explicit_other if isinstance(ref, str) and ref in own_ids)
+    conflicts = {ref for ref, count in ownership.items() if count > 1}
+    if conflicts:
+        problems.append("повторные кандидаты → прочие: " + ", ".join(sorted(conflicts)))
+    for raw in raw_characters:
+        if not isinstance(raw, dict):
+            problems.append("персонаж должен быть объектом — пропущен")
+            continue
         cid = re.sub(r"[^a-z0-9_]", "_", str(raw.get("id", "")).lower()).strip("_")
         cid = prefix + cid if cid else ""
         if not cid or cid.endswith(("author", "other")) or any(ch["id"] == cid for ch in characters):
@@ -819,18 +1089,22 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
             continue
         own = []
         gender = raw.get("gender") if raw.get("gender") in ("m", "f", "?") else "?"
-        for ref in raw.get("candidates", []):
-            if ref not in own_ids:
-                problems.append(f"{cid}: несуществующий кандидат {ref}")
-            elif ref in used:
-                problems.append(f"{ref} указан дважды ({used[ref]} и {cid}) — оставлен у {used[ref]}")
-            elif own and verdicts is not None and verdicts.get(ref) != "same":
-                dropped.append(f"{ref} {candidates[ref]['display']} → прочие: проверка «{verdicts.get(ref, 'нет ответа')}» для {cid}")
-            elif own and gender in ("m", "f") and candidates[ref]["gender"] in ("m", "f") and candidates[ref]["gender"] != gender \
-                    and candidates[ref].get("gender_source") in ("verb", "Patr", "Title"):
-                # Только надёжный род: глагол в ремарке, отчество, обращение. Уменьшительные («Ганечка») словарь
-                # часто считает женскими — по имени род не решает.
-                dropped.append(f"{ref} {candidates[ref]['display']} → прочие: род {candidates[ref]['gender']}, у {cid} {gender}")
+        refs = character_refs(raw, r, candidates)
+        if not refs:
+            problems.append(f"{cid}: нет допустимых кандидатов — пропущен")
+            continue
+        anchor = refs[0]
+        for ref in refs:
+            candidate = candidates[ref]
+            if ref in conflicts:
+                dropped.append(f"{ref} {candidate['display']} → прочие: несколько владельцев")
+            elif candidate["kind"] == "family":
+                dropped.append(f"{ref} {candidate['display']} → прочие: семья, не один человек")
+            elif gender in ("m", "f") and candidate["gender"] in ("m", "f") and candidate["gender"] != gender \
+                    and candidate.get("gender_source") in ("verb", "Patr", "Title"):
+                dropped.append(f"{ref} {candidate['display']} → прочие: род {candidate['gender']}, у {cid} {gender}")
+            elif ref != anchor and (anchor not in own or not verdicts or verdicts.get((str(raw.get("id", "")), anchor, ref)) != "same"):
+                dropped.append(f"{ref} {candidate['display']} → прочие: склейка с {anchor} не подтверждена для {cid}")
             else:
                 used[ref] = cid
                 own.append(ref)
@@ -838,18 +1112,21 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
             problems.append(f"{cid}: нет ни одного кандидата — пропущен")
             continue
         characters.append({"id": cid, "name": str(raw.get("name") or ""), "gender": gender, "candidates": own})
-    # Обращение без имени («генерал», «господин») — только тому, перед чьим именем оно стоит почти всегда.
+    # Any named candidate can contradict a title, even if the LLM omitted that person.
     for ch in characters:
-        for ref in [ref for ref in ch["candidates"][1:] if candidates[ref]["kind"] == "title"]:
+        for ref in [ref for ref in ch["candidates"] if candidates[ref]["kind"] == "title"]:
             word = candidates[ref]["key"]
             per = {other["id"]: sum(candidates[x]["titles"].get(word, 0) for x in other["candidates"] if x != ref) for other in characters}
-            total = sum(per.values())
-            if total == 0 or per[ch["id"]] < 0.8 * total:
+            unassigned = sum(candidates[x]["titles"].get(word, 0) for x in own_ids
+                             if candidates[x]["kind"] == "name" and used.get(x, "other") == "other")
+            total = sum(per.values()) + unassigned
+            if (total > 0 and per[ch["id"]] < total) or (total == 0 and len(ch["candidates"]) == 1):
                 ch["candidates"].remove(ref)
                 used[ref] = "other"
                 other_owner = max(per, key=per.get) if total else None
-                dropped.append(f"{ref} {candidates[ref]['display']} → прочие: обращение стоит перед именем {ch['id']} "
+                dropped.append(f"{ref} {candidates[ref]['display']} → прочие: обращение связано с именем {ch['id']} "
                                f"{per[ch['id']]} из {total} раз" + (f" (чаще {other_owner})" if other_owner and other_owner != ch["id"] else ""))
+    characters = [ch for ch in characters if ch["candidates"]]
     for ch in characters:
         # Имя только из слов книги: «Аглая Ивановна Епанчина» (все слова найдены) — да; «Анастасия (Настенька)»,
         # если «Анастасии» в книге нет, — нет. Тогда самая полная найденная форма в именительном падеже.
@@ -860,8 +1137,8 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
                           key=lambda c: (len(c["key"].split()), c["count"]), default=candidates[ch["candidates"][0]])
             ch["name"] = " ".join(w.capitalize() if longest["kind"] == "name" else w for w in longest["key"].split())
     other = []
-    for ref in answer.get("other", []):
-        if ref in own_ids and ref not in used:
+    for ref in explicit_other:
+        if isinstance(ref, str) and ref in own_ids and ref not in used:
             used[ref] = "other"
             other.append(ref)
     for line in dropped:
@@ -886,6 +1163,8 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
         ch["forms"] = [f for f, _ in forms.most_common()]
     for ref in other:
         alias[candidates[ref]["key"]].add("other")
+        for form in candidates[ref]["forms"]:
+            alias[form.lower().replace("ё", "е")].add("other")
     characters.sort(key=lambda ch: (-(ch["speaker"] * 3 + ch["mentions"]), ch["id"]))
     return {
         "sections": r["sections"], "title": r["title"], "characters": characters,
@@ -900,21 +1179,28 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
 
 
 def apply(args) -> None:
-    data = json.load(open(os.path.join(args.dir, "candidates.json"), encoding="utf-8"))
-    request = json.load(open(os.path.join(args.dir, "llm_request.json"), encoding="utf-8"))
+    data = read_json(os.path.join(args.dir, "candidates.json"))
+    request = read_json(os.path.join(args.dir, "llm_request.json"))
     candidates = {c["id"]: c for c in data["candidates"]}
     collection = request["scope"] == "section"
     casts = []
     for r in request["requests"]:
         answer = load_answer(os.path.join(args.dir, "answers", r["name"] + ".json"))
+        main_meta = load_answer(os.path.join(args.dir, "answers", r["name"] + ".meta.json"))
+        if not metadata_matches(main_meta, r["prompt"], args.dir) or not valid_response(answer):
+            raise ValueError(f"[{r['name']}] ответ устарел или не проверен: выполните llm перед apply")
         checked = load_answer(os.path.join(args.dir, "answers", r["name"] + ".verify.json"))
-        verdicts = {c.get("candidate"): c.get("verdict") for c in checked.get("checks", [])} if checked else None
+        check_prompt = verify_prompt(r, answer, candidates, collection)
+        check_meta = load_answer(os.path.join(args.dir, "answers", r["name"] + ".verify.meta.json"))
+        if check_prompt and not metadata_matches(check_meta, check_prompt, args.dir):
+            checked = None
+        verdicts = verification_verdicts(checked, answer, r, candidates)
         if verdicts is None and answer and any(len(ch.get("candidates", [])) > 1 for ch in answer.get("characters", [])):
             verdicts = {}  # склейки без второй проверки не принимаются
         casts.append(build_cast(r, answer, verdicts, candidates, r["name"] + "." if collection else ""))
     section_cast = {sid: i for i, cast in enumerate(casts) for sid in cast["sections"]}
     save(args.dir, "cast.json", {
-        "book": data["book"], "scope": request["scope"], "narrator": "author", "others": "other",
+        "book": data["book"], "scope": request["scope"], "input_sha256": artifact_identity(args.dir), "narrator": "author", "others": "other",
         "sections": [dict(s, cast=section_cast.get(s["id"])) for s in data["sections"]], "casts": casts})
     total = sum(len(c["characters"]) for c in casts)
     print(f"«{data['book']}»: наборов {len(casts)}, персонажей {total}, "
@@ -937,9 +1223,11 @@ def voices(args) -> None:
     """Свой голос — главным: тем, кто говорит (реплики в ремарках) или часто упоминается; по полу, по одному
     на персонажа. Когда голоса нужного пола кончились — общий голос с тем, с кем персонаж почти не встречается
     в одних абзацах. Остальные (второстепенные, молчащие, без пола) — голос «прочих» своего пола или автора."""
-    cast = json.load(open(os.path.join(args.dir, "cast.json"), encoding="utf-8"))
-    candidates = {c["id"]: c for c in json.load(open(os.path.join(args.dir, "candidates.json"), encoding="utf-8"))["candidates"]}
-    spec = json.load(open(args.voices, encoding="utf-8"))
+    cast = read_json(os.path.join(args.dir, "cast.json"))
+    if cast.get("input_sha256") != artifact_identity(args.dir):
+        raise ValueError("cast.json от другого извлечения: повторите llm и apply")
+    candidates = {c["id"]: c for c in read_json(os.path.join(args.dir, "candidates.json"))["candidates"]}
+    spec = read_json(args.voices)
     reserved = {spec["narrator"], spec["other_m"], spec["other_f"]}
     pool = {g: [v["id"] for v in spec["voices"] if v["gender"] == g and v["id"] not in reserved] for g in ("m", "f")}
     unknown = [v["id"] for v in spec["voices"] if v["gender"] not in ("m", "f")]
@@ -952,7 +1240,7 @@ def voices(args) -> None:
         holders: dict[str, list] = collections.defaultdict(list)
         for ch in order:
             main = ch["gender"] in ("m", "f") and (ch["speaker"] >= args.min_speaker or ch["mentions"] >= args.min_mentions)
-            if not main:
+            if not main or not pool.get(ch["gender"]):
                 ch["voice"] = spec["other_" + ch["gender"]] if ch["gender"] in ("m", "f") else spec["narrator"]
                 ch["role"] = "other"
                 continue
@@ -986,8 +1274,10 @@ def voices(args) -> None:
 
 def export(args) -> None:
     """cast.json + отпечатки → .mytts-book: без текста книги и примеров, можно передавать другим."""
-    cast = json.load(open(os.path.join(args.dir, "cast.json"), encoding="utf-8"))
-    index = json.load(open(os.path.join(args.dir, "book_index.json"), encoding="utf-8"))
+    cast = read_json(os.path.join(args.dir, "cast.json"))
+    if cast.get("input_sha256") != artifact_identity(args.dir):
+        raise ValueError("cast.json от другого извлечения: повторите llm и apply")
+    index = read_json(os.path.join(args.dir, "book_index.json"))
     if "sentences" not in index:
         sys.exit("book_index.json старого формата: повторите extract")
     by_section: dict[str, list] = collections.defaultdict(list)
@@ -1004,8 +1294,19 @@ def export(args) -> None:
             if ch.get("voice") and ch.get("role") in ("own", "shared"):
                 item["voice_hint"] = ch["voice"]
             characters.append(item)
-        other = [o["display"] for o in group["other"]] + [ch["name"] for ch in group["characters"]
-                                                          if ch.get("role") == "other" and not args.keep_other]
+        ambiguous = set(group.get("ambiguous", {}))
+        for item in characters:
+            item["forms"] = [form for form in item["forms"] if form.lower().replace("ё", "е") not in ambiguous]
+        # Unrecognized aliases stay explicitly in «прочие», including their case forms.
+        candidates = {c["id"]: c for c in read_json(os.path.join(args.dir, "candidates.json"))["candidates"]}
+        other = []
+        for entry in group["other"]:
+            candidate = candidates[entry["candidate"]]
+            other += [entry["display"], candidate["key"]] + list(candidate["forms"])[:args.max_forms]
+        for ch in group["characters"]:
+            if ch.get("role") == "other" and not args.keep_other:
+                other += [ch["name"]] + ch["forms"][:args.max_forms]
+        other = list(dict.fromkeys(other + sorted(ambiguous)))
         casts.append({"sections": group["sections"], "characters": characters, "other": other})
     data = {
         "format": "mytts-book", "version": 1, "book": index["book"], "scope": cast["scope"],
@@ -1014,8 +1315,7 @@ def export(args) -> None:
         "casts": casts, "fingerprint": index["fingerprint"], "fingerprints": dict(by_section),
     }
     target = args.output or os.path.join(args.dir, re.sub(r"[^\w.-]+", "_", index["book"]["title"]) + ".mytts-book")
-    with open(target, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+    save(os.path.dirname(os.path.abspath(target)), os.path.basename(target), data, compact=True)
     total = sum(len(v) for v in by_section.values())
     print(f"{target}: персонажей {sum(len(c['characters']) for c in casts)}, разделов {len(data['sections'])}, "
           f"отпечатков {total}, {os.path.getsize(target) / 1024:.0f} КБ")
