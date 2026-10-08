@@ -217,7 +217,7 @@ def stories(path: str, book: Book) -> Book:
                 sections.append({"id": f"s{len(sections) + 1}", "title": title})
             paragraphs.append((keys[key], text))
         book = Book(book.title, book.author, sections, paragraphs, book.notes, book.analysis)
-    return book
+    return merge_tiny_sections(book)  # заголовок части («Люди») — к первому рассказу
 
 
 def chapters(path: str) -> Book:
