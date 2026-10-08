@@ -276,6 +276,11 @@ class ExtractorTests(unittest.TestCase):
                           "– Не надо! – вдруг тоненько завопил, непонятно к кому обращаясь, вжавшийся в сиденье Виталик."])
         self.assertEqual(1, c[(0, "виталик")].speaker)
 
+    def test_present_tense_remark(self):
+        c = self.extract(["Пришла Лорен. Ушла Лорен.", "— Наверное, у озера, — говорит Лорен.", "— Смогу! — кричит раздухарившийся Аркаша."])
+        self.assertEqual(1, c[(0, "лорен")].speaker)
+        self.assertEqual(1, c[(0, "аркаша")].speaker)
+
     def test_nickname_with_plural_only_parse_is_one_person(self):
         c = self.extract(["– Живем, – обрадовался Санек.", "– Рожу видел! – не сдавался Санек."])
         self.assertEqual("name", c[(0, "санек")].kind)
@@ -727,6 +732,26 @@ class NotesTests(unittest.TestCase):
         self.assertEqual("— Нет! — крикнула Аглая.", b.normalize_text("– Нет! – крикнула Аглая[12]."))
         self.assertEqual("Рогожин вошёл", b.normalize_text("Pогожин\u00ad вошёл * * *"))
         self.assertEqual("Сине-зелёный дом — большой.", b.normalize_text("Сине-зелёный дом - большой."))
+
+
+class CollectionTests(unittest.TestCase):
+    def book(self, sections):
+        paragraphs = [(i, t) for i, texts in enumerate(sections) for t in texts]
+        return b.Book("Т", "", [{"id": f"s{i+1}", "title": f"Глава {i+1}"} for i in range(len(sections))], paragraphs)
+
+    def test_collection_has_heroes_confined_to_stories(self):
+        book = self.book([["Пришла Зина. Ушла Зина. Видела Зину."], ["Пришёл Павел. Ушёл Павел. Видел Павла."],
+                          ["Пришла Ванда. Ушла Ванда. Видела Ванду."]])
+        self.assertTrue(b.detect_collection(book, b.Extractor().run(book, False)))
+
+    def test_novel_heroes_pass_through_chapters(self):
+        book = self.book([["Пришла Зина. Ушёл Павел."], ["Видела Зину. Видел Павла."], ["Ушла Зина. Пришёл Павел."]])
+        self.assertFalse(b.detect_collection(book, b.Extractor().run(book, False)))
+
+    def test_repeated_chapter_titles_mean_novel(self):
+        book = self.book([["Пришла Зина. Ушла Зина."], ["Пришёл Павел. Ушёл Павел."], ["Пришла Ванда. Ушла Ванда."]])
+        book.sections[2]["title"] = book.sections[0]["title"] = "Тед"
+        self.assertFalse(b.detect_collection(book, b.Extractor().run(book, False)))
 
 
 class ExportTests(unittest.TestCase):
