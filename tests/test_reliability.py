@@ -685,6 +685,50 @@ class Fb2Tests(unittest.TestCase):
             self.check(b.read_book(path))
 
 
+class NotesTests(unittest.TestCase):
+    def make_epub(self, folder):
+        import zipfile
+        path = os.path.join(folder, "book.epub")
+        chapter = ('<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+                   '<p>Пришёл Рогожин<a epub:type="noteref" href="notes.xhtml#n1"><sup>1</sup></a>. Рогожин сел.</p>'
+                   '<p>— Да, — сказал Рогожин.</p>'
+                   '<aside epub:type="footnote"><p>Карамзин писал об этом.</p></aside>'
+                   '<div class="footnote"><p>Наполеон тоже.</p></div></body></html>')
+        notes = '<html xmlns="http://www.w3.org/1999/xhtml"><body><p id="n1">Тацит упоминал Рогожина.</p></body></html>'
+        opf = ('<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata '
+               'xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Т</dc:title></metadata><manifest>'
+               '<item id="c" href="c.xhtml" media-type="application/xhtml+xml"/>'
+               '<item id="n" href="notes.xhtml" media-type="application/xhtml+xml"/></manifest>'
+               '<spine><itemref idref="c"/><itemref idref="n" linear="no"/></spine></package>')
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("META-INF/container.xml", '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+                       'version="1.0"><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>')
+            z.writestr("content.opf", opf)
+            z.writestr("c.xhtml", chapter)
+            z.writestr("notes.xhtml", notes)
+        return path
+
+    def test_footnotes_are_excluded_from_analysis_but_kept_for_fingerprints(self):
+        with tempfile.TemporaryDirectory() as folder:
+            book = b.read_book(self.make_epub(folder))
+            texts = [t for _, t in book.paragraphs]
+            self.assertEqual(5, len(texts))  # отпечатки — по всему тексту, включая сноски
+            self.assertEqual(3, len(book.notes))
+            analysed = [t for _, t in b.normalized(book).paragraphs if t]
+            self.assertEqual(["Пришёл Рогожин. Рогожин сел.", "— Да, — сказал Рогожин."], analysed)
+            found = b.Extractor().run(b.normalized(book), per_section=False)
+            self.assertNotIn((0, "карамзин"), found)
+            self.assertNotIn((0, "тацит"), found)
+            self.assertEqual(3, found[(0, "рогожин")].count)
+
+    def test_normalization_unifies_dashes_quotes_and_strips_markers(self):
+        self.assertEqual("— Привет, — сказал Рогожин.", b.normalize_text("- Привет, - сказал Рогожин."))
+        self.assertEqual("— Да, — ответил князь…", b.normalize_text("-- Да, -- ответил князь..."))
+        self.assertEqual("— Нет! — крикнула Аглая.", b.normalize_text("– Нет! – крикнула Аглая[12]."))
+        self.assertEqual("Рогожин вошёл", b.normalize_text("Pогожин\u00ad вошёл * * *"))
+        self.assertEqual("Сине-зелёный дом — большой.", b.normalize_text("Сине-зелёный дом - большой."))
+
+
 class ExportTests(unittest.TestCase):
     def test_rejected_title_does_not_erase_protagonist_voice_priority(self):
         with tempfile.TemporaryDirectory() as folder:

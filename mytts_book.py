@@ -76,6 +76,8 @@ class Book:
     author: str
     sections: list            # [{"id": "s1", "title": "Старшая сестра"}]
     paragraphs: list          # [(номер раздела, текст)]
+    notes: frozenset = frozenset()  # номера абзацев-сносок: в отпечатках есть, в разборе персонажей — нет
+    analysis: dict = field(default_factory=dict)  # номер абзаца → текст без значков сносок («Рогожин¹»)
 
 
 def read_epub(path: str, nested: bool = False) -> Book:
@@ -103,6 +105,10 @@ def read_epub(path: str, nested: bool = False) -> Book:
                 starts[normalize_href(href)].append((None, len(sections)))
                 sections.append({"id": f"s{len(sections) + 1}", "title": PurePosixPath(href).stem})
         paragraphs: list[tuple[int, str]] = []
+        notes: set[int] = set()
+        analysis: dict[int, str] = {}
+        aside = {items[e.get("idref")].get("href") for e in opf.iter()
+                 if e.tag.endswith("}itemref") and e.get("idref") in items and e.get("linear") == "no"}
         current = 0
         for href in spine:
             if not href.endswith((".xhtml", ".html", ".htm")):
@@ -117,11 +123,54 @@ def read_epub(path: str, nested: bool = False) -> Book:
                 if tag.name in BLOCKS and not tag.find(BLOCKS):
                     text = clean(tag.get_text(" "))
                     if text:
+                        bare = text_without_noterefs(tag)
+                        if bare != text:
+                            analysis[len(paragraphs)] = bare
+                        if href in aside or NOTES_TITLE.search(sections[current]["title"] if sections else "") or is_note(tag):
+                            notes.add(len(paragraphs))
                         paragraphs.append((current, text))
     used = sorted({s for s, _ in paragraphs})
     renumber = {old: new for new, old in enumerate(used)}
     sections = [dict(sections[old], id=f"s{renumber[old] + 1}") for old in used]
-    return Book(title, clean(author), sections, [(renumber[s], t) for s, t in paragraphs])
+    return Book(title, clean(author), sections, [(renumber[s], t) for s, t in paragraphs], frozenset(notes), analysis)
+
+
+NOTEREF_TEXT = re.compile(r"^\s*[\[(]?\s*(?:\d{1,3}|[*†‡]+|[ivx]{1,4})\s*[\])]?\s*$", re.IGNORECASE)
+
+
+def text_without_noterefs(tag) -> str:
+    """Текст абзаца без значков сносок: <a epub:type="noteref">, <sup>1</sup>, <a href="#n1">[1]</a>."""
+    def skip(node) -> bool:
+        while node is not None and node is not tag:
+            name = getattr(node, "name", None)
+            if name in ("sup", "a"):
+                kind = (node.get("epub:type") or "") + " " + (node.get("role") or "")
+                if "noteref" in kind or NOTEREF_TEXT.match(node.get_text()):
+                    return True
+            node = node.parent
+        return False
+    return clean(" ".join(str(x) for x in tag.find_all(string=True) if not skip(x.parent)))
+
+
+# Раздел целиком из сносок: последний уровень названия — только это слово («Примечания», «ЧАСТЬ I. Сноски»).
+NOTES_TITLE = re.compile(r"(?:^|[\s.])(?:примечания|примечание|сноски|комментарии|notes|endnotes|footnotes)\.?\s*$", re.IGNORECASE)
+NOTE_CLASS = re.compile(r"(?:^|[\s_-])(?:foot|end|rear)?notes?(?:$|[\s_-])|snoska|sноск|primech|komment", re.IGNORECASE)
+
+
+def is_note(tag) -> bool:
+    """Абзац внутри сноски: <aside>, epub:type="footnote|endnote|rearnote|note", класс note/footnote/snoska."""
+    for node in [tag, *tag.parents]:
+        if getattr(node, "name", None) is None:
+            continue
+        if node.name == "aside":
+            return True
+        kind = (node.get("epub:type") or node.get("type") or "")
+        if any(k in kind.split() for k in ("footnote", "endnote", "rearnote", "note", "footnotes", "endnotes", "rearnotes")):
+            return True
+        classes = node.get("class") or []
+        if any(NOTE_CLASS.search(c) for c in (classes if isinstance(classes, list) else [classes])):
+            return True
+    return False
 
 
 HEADING = re.compile(r"^(?:(?:глава|часть|книга|chapter|part)\s+(?:[0-9]{1,3}|[ivxlcdm]{1,7}|[а-яё-]{3,20})|"
@@ -150,7 +199,7 @@ def chapters(path: str) -> Book:
             current = len(sections) - 1
         previous_section = old
         paragraphs.append((current, text))
-    return merge_tiny_sections(Book(book.title, book.author, sections, paragraphs))
+    return merge_tiny_sections(Book(book.title, book.author, sections, paragraphs, book.notes, book.analysis))
 
 
 def merge_tiny_sections(book: Book, smallest: int = 3) -> Book:
@@ -169,7 +218,7 @@ def merge_tiny_sections(book: Book, smallest: int = 3) -> Book:
     used = sorted(set(target.values()))
     renumber = {old: new for new, old in enumerate(used)}
     sections = [dict(book.sections[old], id=f"s{renumber[old] + 1}") for old in used]
-    return Book(book.title, book.author, sections, [(renumber[target[s]], t) for s, t in book.paragraphs])
+    return Book(book.title, book.author, sections, [(renumber[target[s]], t) for s, t in book.paragraphs], book.notes, book.analysis)
 
 
 def read_book(path: str, nested: bool = False) -> Book:
@@ -305,6 +354,46 @@ def resolve(origin: str, href: str) -> str:
 
 def normalize_href(href: str) -> str:
     return os.path.normpath(href.split("#")[0]).replace("\\", "/")
+
+
+# ---------------------------------------------------------------- нормализация для разбора
+# Только для поиска имён и ремарок; отпечатки для узнавания книги считаются по исходному тексту.
+INVISIBLE = re.compile("[\u00ad\u200b-\u200f\u2060\ufeff\u202a-\u202e]")
+LATIN_LOOKALIKE = str.maketrans("aeopcyxAEOPCTXKMHB", "аеорсухАЕОРСТХКМНВ")
+MIXED_WORD = re.compile(r"[A-Za-zА-ЯЁа-яё]+")
+DASH_START = re.compile(r"^\s*(?:--?|[‐‑‒–—―−])\s*")
+DASH_INSIDE = re.compile(r"(?<=\S)\s+(?:--?|[‐‒–—―−])\s+|(?<=[,.!?…»\"])(?:--?|[‒–—―−])\s+")
+FOOTNOTE = re.compile(r"\[\d{1,3}\]|\{\d{1,3}\}|[¹²³⁰⁴-⁹]+")
+DECOR = re.compile(r"[*•§~_#|¤◆◇■□●○★☆►▪︎❖✦✧]+")
+QUOTES = str.maketrans({"„": "«", "“": "»", "”": "»", "‟": "«", "‹": "«", "›": "»", '"': "«"})
+
+
+def normalize_text(text: str) -> str:
+    """Механическая очистка перед разбором: тире любого вида («-», «--», «–», «―») → «—», кавычки → «»,
+    «...» → «…»; без невидимых символов (мягкий перенос), сносок («[1]», «¹»), звёздочек и декора;
+    латинские буквы-двойники внутри русских слов («Pогожин» из распознанного скана) → русские."""
+    text = INVISIBLE.sub("", text)
+    text = FOOTNOTE.sub("", text)
+    text = DECOR.sub(" ", text)
+    text = MIXED_WORD.sub(lambda m: m.group().translate(LATIN_LOOKALIKE)
+                          if re.search("[А-ЯЁа-яё]", m.group()) and re.search("[A-Za-z]", m.group()) else m.group(), text)
+    text = text.replace("...", "…")
+    text = DASH_START.sub("— ", text, count=1) if DASH_START.match(text) and len(text) > 2 else text
+    text = DASH_INSIDE.sub(" — ", text)
+    # Кавычки: открывающая/закрывающая по положению (прямые «"» из плохих конвертеров).
+    text = re.sub(r'"(?=\w)', "«", text)
+    text = re.sub(r'(?<=\S)"', "»", text)
+    text = text.translate(QUOTES)
+    text = re.sub(r"\s+([.,!?…;:»)])", r"\1", text)  # пробел на месте убранного значка сноски
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalized(book: Book) -> Book:
+    """Та же книга (разделы, порядок абзацев) с очищенным для разбора текстом; пустые абзацы остаются пустой
+    строкой, чтобы номера абзацев совпадали с исходными."""
+    return Book(book.title, book.author, book.sections,
+                [(s, "" if i in book.notes else normalize_text(book.analysis.get(i, t))) for i, (s, t) in enumerate(book.paragraphs)],
+                book.notes)
 
 
 def clean(text: str) -> str:
@@ -997,16 +1086,17 @@ def extract(args) -> None:
     started = time.time()
     book = read_book(args.book)
     extractor = Extractor()
-    found = extractor.run(book, per_section=False)
+    text = normalized(book)  # разбор — по очищенному тексту, отпечатки — по исходному
+    found = extractor.run(text, per_section=False)
     collection = args.scope == "section" or (args.scope == "auto" and detect_collection(book, found))
     if collection:
-        found = Extractor().run(book, per_section=True)
+        found = Extractor().run(text, per_section=True)
     else:
         # Роман — по главам: обращение («генерал») решается для каждой главы, где оно однозначно.
         chaptered = chapters(args.book)
         if len(chaptered.sections) > len(book.sections):
-            book = chaptered
-            found = Extractor().run(book, per_section=False)
+            book, text = chaptered, normalized(chaptered)
+            found = Extractor().run(text, per_section=False)
     groups: dict[int, list] = collections.defaultdict(list)
     for c in found.values():
         if c.descriptor and c.speaker < 2 and not c.titles:
@@ -1035,7 +1125,7 @@ def extract(args) -> None:
                 # Сколько абзацев с каждым кандидатом: голос делят только те, кто почти не встречается.
                 "together_counts": {ids[(scope, k)]: n for k, n in c.together.most_common() if (scope, k) in ids},
                 "examples": c.examples,
-                **(label_contexts(book, c, per_chapter=not collection and c.kind == "title") if needs_contexts(c) else {}),
+                **(label_contexts(text, c, per_chapter=not collection and c.kind == "title") if needs_contexts(c) else {}),
             })
         if not ranked:
             continue
