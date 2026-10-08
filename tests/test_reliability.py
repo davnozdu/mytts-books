@@ -130,6 +130,26 @@ class CastTests(unittest.TestCase):
         self.assertCountEqual(self.r["candidates"], assigned)
         self.assertEqual(len(assigned), len(set(assigned)))
 
+    def test_bare_surname_shared_by_named_relatives_is_other(self):
+        self.c["c1"] = candidate("иволгин",count=20)
+        self.c["c1"]["roles"] = {"Surn":20}
+        self.c["c2"] = candidate("ардалион александрович")
+        self.c["c3"] = candidate("гаврила ардалионович иволгин")
+        result = self.cast([character("father",["c1","c2"]),character("son",["c3"])],
+                           checks=[dict(character="father",anchor="c2",candidate="c1",verdict="same")])
+        self.assertEqual(["c2"], result["characters"][0]["candidates"])
+        self.assertIn("c1",{x["candidate"] for x in result["other"]})
+
+    def test_ambiguous_surname_anchor_cannot_join_other_aliases(self):
+        self.c["c1"] = candidate("иволгин",count=20)
+        self.c["c1"]["roles"] = {"Surn":20}
+        self.c["c2"] = candidate("ардалион",count=2)
+        self.c["c3"] = candidate("гаврила ардалионович иволгин")
+        result = self.cast([character("father",["c1","c2"]),character("son",["c3"])],
+                           checks=[dict(character="father",anchor="c1",candidate="c2",verdict="same")])
+        self.assertEqual(["son"],[c["id"] for c in result["characters"]])
+        self.assertTrue({"c1","c2"}<={x["candidate"] for x in result["other"]})
+
 
 class ExtractorTests(unittest.TestCase):
     def extract(self, paragraphs):
@@ -192,6 +212,46 @@ class ExtractorTests(unittest.TestCase):
     def test_reporting_verb_with_adverbial_phrase(self):
         c = self.extract(["— Да, — отвечал в раздумьи чиновник. — Конечно, — тормошился чиновник."])
         self.assertEqual(2, c[(0,"чиновник")].speaker)
+
+    def test_unknown_female_case_does_not_follow_more_frequent_male_surname(self):
+        c = self.extract(["Генерал Епанчин вошёл. " * 12 +
+                          "Генеральша Епанчина ответила. Он писал генеральше Епанчиной."])
+        self.assertEqual(12, c[(0,"епанчин")].count)
+        self.assertNotIn("Епанчиной", c[(0,"епанчин")].forms)
+        self.assertEqual(2, c[(0,"епанчина")].count)
+        self.assertIn("Епанчиной", c[(0,"епанчина")].forms)
+
+    def test_unknown_surname_inherits_gender_from_patronymic(self):
+        c = self.extract(["Генерал Епанчин вошёл. " * 12 +
+                          "Генеральша Епанчина ответила. Он писал Лизавете Прокофьевне Епанчиной."])
+        self.assertIn((0,"лизавета прокофьевна епанчина"), c)
+        self.assertNotIn((0,"лизавета прокофьевна епанчин"), c)
+
+    def test_addressee_and_speaker_are_two_people(self):
+        c = self.extract(["— Пора, — объявила Евгению Павловичу Лизавета Прокофьевна."])
+        self.assertIn((0,"евгений павлович"), c)
+        self.assertIn((0,"лизавета прокофьевна"), c)
+        self.assertNotIn((0,"евгений павлович лизавета прокофьевна"), c)
+        self.assertEqual(1, c[(0,"лизавета прокофьевна")].speaker)
+
+    def test_adjacent_same_gender_full_names_are_separate(self):
+        c = self.extract(["Вошли Иван Петрович Николай Павлович."])
+        self.assertIn((0,"иван петрович"), c)
+        self.assertIn((0,"николай павлович"), c)
+
+    def test_gender_constraint_accepts_common_gender_surname(self):
+        c = self.extract(["Фердыщенко вошёл. Фердыщенко заговорил. Он спросил господина Фердыщенка."])
+        self.assertEqual(3, c[(0,"фердыщенко")].count)
+
+    def test_preposition_distinguishes_family_from_male_instrumental(self):
+        c = self.extract(["Генерал Епанчин ушёл. Он говорил с Епанчиным. Он отправился к Епанчиным."])
+        self.assertEqual(2, c[(0,"епанчин")].count)
+        self.assertEqual("family", c[(0,"семья епанчин")].kind)
+
+    def test_unqualified_female_case_is_not_a_male_surname(self):
+        c = self.extract(["Генерал Епанчин ушёл. " * 12 + "Генеральша Епанчина ответила. Он говорил о старшей Епанчиной."])
+        self.assertNotIn("Епанчиной", c[(0,"епанчин")].forms)
+        self.assertIn("Епанчиной", c[(0,"епанчина")].forms)
 
 
 class ResponseTests(unittest.TestCase):
@@ -336,6 +396,30 @@ class ResumeTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def test_rejected_title_does_not_erase_protagonist_voice_priority(self):
+        with tempfile.TemporaryDirectory() as folder:
+            candidates = {"c1": candidate("иван петрович", count=30, titles={"князь":1}),
+                          "c2": candidate("николай павлович", count=100, titles={"князь":1}),
+                          "c3": candidate("князь", kind="title", count=2000)}
+            candidates["c2"]["speaker"] = 50
+            candidates["c1"]["together_counts"] = {"c2":10}
+            candidates["c2"]["together_counts"] = {"c1":10}
+            request = dict(candidates=list(candidates), sections=["s1"], title="Fixture")
+            answer = dict(characters=[character("main",["c1","c3"]),character("secondary",["c2"])],other=[])
+            group = b.build_cast(request,answer,{("main","c1","c3"):"same"},candidates,"")
+            self.assertEqual(["c1"],group["characters"][0]["candidates"])
+            b.save(folder,"candidates.json",{"candidates":[dict(c,id=k) for k,c in candidates.items()]})
+            b.save(folder,"llm_request.json",{})
+            b.save(folder,"cast.json",{"book":"Fixture","input_sha256":b.artifact_identity(folder),"casts":[group]})
+            b.save(folder,"voices.json",{"voices":[{"id":"unique","gender":"m"}],
+                   "narrator":"author","other_m":"other_m","other_f":"other_f"})
+            with contextlib.redirect_stdout(io.StringIO()):
+                b.voices(Namespace(dir=folder,voices=str(Path(folder)/"voices.json"),min_speaker=2,
+                                   min_mentions=30,max_shared=2,show_casts=0,show=0))
+            chars={c["id"]:c for c in b.read_json(str(Path(folder)/"cast.json"))["casts"][0]["characters"]}
+            self.assertEqual("own",chars["main"]["role"])
+            self.assertEqual("other",chars["secondary"]["role"])
+
     def test_ambiguous_exported_forms_go_to_other(self):
         with tempfile.TemporaryDirectory() as folder:
             b.save(folder,"candidates.json",{"candidates":[dict(candidate("неизвестный",forms={"Николая":1}),id="c1")]})

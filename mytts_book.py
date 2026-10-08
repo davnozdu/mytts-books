@@ -283,10 +283,14 @@ class Extractor:
         owner = max(self.capitalized[m.group(1) + "а"], self.capitalized[m.group(1) + "я"])
         return owner >= max(5, 3 * self.capitalized[k])
 
-    def chain_key(self, words: list[str], expected_gender: str | None = None) -> tuple[str, list, bool, bool]:
+    def chain_key(self, words: list[str], expected_gender: str | None = None,
+                  expected_case: str | None = None) -> tuple[str, list, bool, bool]:
         """Ключ цепочки «Евгения Павловича» → «евгений павлович»: падеж и род согласуются по всем словам.
         Возвращает (ключ, [(род, роль)], семья, именительный падеж)."""
-        options = [[p for p in self.named(w) if "sing" in p.tag.grammemes or "Sgtm" in p.tag.grammemes] for w in words]
+        named = [self.named(w) for w in words]
+        if expected_case:
+            named = [[p for p in opt if p.tag.case == expected_case] or opt for opt in named]
+        options = [[p for p in opt if "sing" in p.tag.grammemes or "Sgtm" in p.tag.grammemes] for opt in named]
         if expected_gender:
             options = [[p for p in opt if p.tag.gender == expected_gender] or opt for opt in options]
         family = any(self.named(w) and not opt for w, opt in zip(words, options))
@@ -295,6 +299,8 @@ class Extractor:
             if opt:
                 cases = {(p.tag.case, p.tag.gender) for p in opt}
                 shared = cases if shared is None else shared & cases
+        genders = {gender for _, gender in (shared or ()) if gender in ("masc", "femn")}
+        agreed_gender = expected_gender or (next(iter(genders)) if len(genders) == 1 else None)
         keys, info = [], []
         nominative = True
         for w, opt in zip(words, options):
@@ -306,9 +312,13 @@ class Extractor:
                     info.append((None, next(r for r in ("Name", "Patr", "Surn") if r in parses[0].tag.grammemes)))
                 else:  # нет в словаре: «Рогожина», «Фердыщенка» → форма, которая сама встречается в книге
                     adjective = self.first(w)
-                    base = self.unknown_base(low)
+                    gender_hint = agreed_gender
+                    if not gender_hint and low.endswith("ой") and {p.tag.gender for p in self.morph.parse(w)} == {"femn"}:
+                        gender_hint = "femn"
+                    base = self.unknown_base(low, gender_hint)
                     if adjective.tag.POS == "ADJF" and adjective.normal_form.endswith(("ский", "цкий", "ской", "цкой")):
-                        base = adjective.normal_form.replace("ё", "е")
+                        normal = adjective.inflect({"nomn", "sing", agreed_gender or "masc"})
+                        base = (normal.word if normal else adjective.normal_form).replace("ё", "е")
                     keys.append(base)
                     info.append((None, None))
                     nominative = nominative and keys[-1] == low
@@ -322,7 +332,7 @@ class Extractor:
                 forms[(inflected.word if inflected else p.normal_form).replace("ё", "е")].append(p)
             # Одна форма — разные слова («Лебедева»: его или она; «Александра»): чаще встречающаяся в книге.
             # Словарь может не знать уменьшительного («Кирюху» → «кирюх»): тогда форма, которая есть в книге.
-            fallback = self.unknown_base(low)
+            fallback = self.unknown_base(low, agreed_gender)
             if fallback != low and fallback not in forms and all(self.capitalized[f] == 0 for f in forms) and self.capitalized[fallback] > 0:
                 forms[fallback] = forms[max(forms, key=lambda f: self.capitalized[f])]
             key = max(forms, key=lambda f: (self.capitalized[f], f == low))
@@ -333,7 +343,18 @@ class Extractor:
             info.append((gender, next(r for r in ("Name", "Patr", "Surn") if r in chosen.tag.grammemes)))
         return " ".join(keys), info, family, nominative
 
-    def unknown_base(self, low: str) -> str:
+    def unknown_base(self, low: str, expected_gender: str | None = None) -> str:
+        def allowed(base):
+            parses = self.named(base)
+            return not expected_gender or not parses or any(p.tag.gender is None or p.tag.gender == expected_gender
+                                                            or "ms-f" in p.tag.grammemes for p in parses)
+
+        # Unknown surnames still inherit the explicit gender of a title/patronymic.
+        # Frequency alone must not turn «генеральше Епанчиной» into a male surname.
+        if expected_gender == "femn" and low.endswith("ой"):
+            for base in (low[:-2] + "ая", low[:-2] + "а"):
+                if allowed(base) and self.capitalized[base] > 0:
+                    return base
         # Adjectival surnames absent from the dictionary: «Тоцким» → «Тоцкий»,
         # only when that nominative form actually occurs in the same text.
         for ending in ("ого", "ому", "ыми", "ых", "им", "ым", "ом"):
@@ -341,15 +362,34 @@ class Extractor:
                 stem = low[:-len(ending)]
                 for suffix in ("ий", "ый", "ой"):
                     base = stem + suffix
-                    if len(stem) >= 3 and self.capitalized[base] >= max(2, self.capitalized[low] // 4):
+                    if len(stem) >= 3 and allowed(base) and self.capitalized[base] >= max(2, self.capitalized[low] // 4):
                         return base
         for ending in CASE_ENDINGS:
             if low.endswith(ending) and len(low) - len(ending) >= 3:
                 stem = low[: -len(ending)]
                 for base in (stem, stem + "о", stem + "а", stem + "я", stem + "ь"):
-                    if base != low and self.capitalized[base] >= max(2, self.capitalized[low] // 4):
+                    if base != low and allowed(base) and self.capitalized[base] >= max(2, self.capitalized[low] // 4):
                         return base
         return low
+
+    def name_can_continue(self, words: list[str], following: str) -> bool:
+        """Adjacent names must agree; an addressee and a speaker are not one long name."""
+        def options(word):
+            return [p for p in self.named(word) if "sing" in p.tag.grammemes or "Sgtm" in p.tag.grammemes]
+        previous = [options(word) for word in words]
+        next_options = options(following)
+        shared = None
+        for opt in previous:
+            if opt:
+                values = {(p.tag.case, p.tag.gender) for p in opt}
+                shared = values if shared is None else shared & values
+        if shared and next_options and not shared & {(p.tag.case, p.tag.gender) for p in next_options}:
+            return False
+        if any("Patr" in p.tag.grammemes for opt in previous for p in opt):
+            roles = {role for p in next_options for role in ("Name", "Patr", "Surn") if role in p.tag.grammemes}
+            if "Name" in roles and "Surn" not in roles:
+                return False
+        return True
 
     def run(self, book: Book, per_section: bool) -> dict:
         self.statistics(book.paragraphs)
@@ -393,10 +433,18 @@ class Extractor:
                     continue
                 run = [m]
                 while i + 1 < len(words) and text[run[-1].end():words[i + 1].start()] == " " and self.is_name(words[i + 1].group(), False):
+                    if not self.name_can_continue([x.group() for x in run], words[i + 1].group()):
+                        break
                     i += 1
                     run.append(words[i])
+                expected_case = parsed.tag.case if title else None
+                first_index = i - len(run) + 1
+                if not title and first_index > 0 and text[words[first_index-1].end():run[0].start()] == " ":
+                    expected_case = {"к":"datv", "ко":"datv", "от":"gent", "из":"gent", "без":"gent",
+                                     "для":"gent", "у":"gent", "около":"gent", "возле":"gent", "до":"gent",
+                                     "над":"ablt", "перед":"ablt", "между":"ablt"}.get(words[first_index-1].group().lower())
                 key, info, family, nominative = self.chain_key([x.group() for x in run],
-                    parsed.tag.gender if title else None)
+                    parsed.tag.gender if title else None, expected_case)
                 cand = add(("семья " + key) if family else key, "family" if family else "name", section, text, run[0].start(), run[-1].end())
                 cand.forms[text[run[0].start():run[-1].end()]] += 1
                 for gender, role in info:
@@ -531,14 +579,20 @@ PROMPT = """Ты помогаешь подготовить {what} к озвуч�
 Лучше оставить настоящего персонажа в "other", чем склеить двух разных людей.
 
 Правила:
+- Персонажей в characters расположи по значимости в повествовании: сначала главные, затем
+  второстепенные и эпизодические. Порядок нужен для приоритета личного голоса, не для объединения имён.
+  Учитывай контекст частых обращений, но не закрепляй неоднозначное обращение за одним человеком.
+- Если примеры однозначно описывают отдельного человека, сохрани его персонажем даже при редких
+  упоминаниях или участии во вложенном рассказе. Невозможность склеить его с другими именами не
+  означает, что надо удалить саму личность: можно оставить одного надёжного кандидата.
 - Каждый номер кандидата укажи ровно один раз: либо у одного персонажа, либо в "other".
 - Первым в "candidates" ставь самого надёжного кандидата персонажа (самое частое имя).
 - name — полное имя из найденных форм (например «Лев Николаевич Мышкин», если такие формы есть);
   ничего не додумывай: ни полных имён, которых нет в тексте, ни пояснений в скобках.
 - В "other" — не персонажи (места, книги, исторические лица, которых только упоминают), семьи
   во множественном числе, и всё, что нельзя уверенно отнести к одному лицу.
-- Обращение без имени («князь», «генерал») отнеси к персонажу, которого им называют почти всегда;
-  если так называют нескольких — в "other".
+- Обращение без имени («князь», «генерал») отнеси к персонажу только при отсутствии других
+  носителей этого обращения в доступных примерах и связях; если так называют нескольких — в "other".
 - Отец и сын, муж и жена с одной фамилией — разные персонажи; общую фамилию без имени, если по
   примерам не ясно, кто это, отправь в "other".
 - gender: "m", "f" или "?" — по тексту.
@@ -1095,7 +1149,7 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
     conflicts = {ref for ref, count in ownership.items() if count > 1}
     if conflicts:
         problems.append("повторные кандидаты → прочие: " + ", ".join(sorted(conflicts)))
-    for raw in raw_characters:
+    for priority, raw in enumerate(raw_characters):
         if not isinstance(raw, dict):
             problems.append("персонаж должен быть объектом — пропущен")
             continue
@@ -1128,7 +1182,29 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
         if not own:
             problems.append(f"{cid}: нет ни одного кандидата — пропущен")
             continue
-        characters.append({"id": cid, "name": str(raw.get("name") or ""), "gender": gender, "candidates": own})
+        characters.append({"id": cid, "name": str(raw.get("name") or ""), "gender": gender,
+                           "priority": priority, "candidates": own})
+    # A bare surname shared by independently named relatives is also ambiguous.
+    # This does not reassign the surname: it preserves their full, distinct names.
+    for ch in characters:
+        for ref in list(ch["candidates"]):
+            candidate = candidates[ref]
+            if candidate["kind"] != "name" or len(candidate["key"].split()) != 1 or not candidate.get("roles", {}).get("Surn"):
+                continue
+            relatives = [x for x in own_ids if candidates[x]["kind"] == "name"
+                         and len(candidates[x]["key"].split()) > 1
+                         and candidates[x]["key"].split()[-1] == candidate["key"]
+                         and used.get(x, "other") != ch["id"]]
+            if relatives:
+                was_anchor = ch["candidates"][0] == ref
+                ch["candidates"].remove(ref)
+                used[ref] = "other"
+                dropped.append(f"{ref} {candidate['display']} → прочие: фамилия встречается в других полных именах")
+                if was_anchor:
+                    for dependent in ch["candidates"]:
+                        used[dependent] = "other"
+                        dropped.append(f"{dependent} {candidates[dependent]['display']} → прочие: склейка зависит от неоднозначной фамилии {ref}")
+                    ch["candidates"] = []
     # Any named candidate can contradict a title, even if the LLM omitted that person.
     for ch in characters:
         for ref in [ref for ref in ch["candidates"] if candidates[ref]["kind"] == "title"]:
@@ -1182,7 +1258,7 @@ def build_cast(r: dict, answer: dict | None, verdicts: dict | None, candidates: 
         alias[candidates[ref]["key"]].add("other")
         for form in candidates[ref]["forms"]:
             alias[form.lower().replace("ё", "е")].add("other")
-    characters.sort(key=lambda ch: (-(ch["speaker"] * 3 + ch["mentions"]), ch["id"]))
+    characters.sort(key=lambda ch: (ch["priority"], ch["id"]))
     return {
         "sections": r["sections"], "title": r["title"], "characters": characters,
         "other": [{"candidate": ref, "display": candidates[ref]["display"], "count": candidates[ref]["count"]} for ref in other],
@@ -1253,7 +1329,10 @@ def voices(args) -> None:
         return sum(candidates[x].get("together_counts", {}).get(y, 0) for x in a["candidates"] for y in b["candidates"])
 
     for group in cast["casts"]:
-        order = sorted(group["characters"], key=lambda ch: (-ch["speaker"], -ch["mentions"], ch["id"]))
+        # Rejected ambiguous titles must not erase the protagonist's voice priority.
+        # Legacy casts without model priority keep their previous ordering.
+        order = sorted(group["characters"], key=lambda ch: (ch.get("priority", len(group["characters"])),
+                       -ch["speaker"], -ch["mentions"], ch["id"]))
         holders: dict[str, list] = collections.defaultdict(list)
         for ch in order:
             main = ch["gender"] in ("m", "f") and (ch["speaker"] >= args.min_speaker or ch["mentions"] >= args.min_mentions)
@@ -1385,8 +1464,8 @@ def add_llm_options(parser) -> None:
     parser.add_argument("--redo", action="store_true", help="спросить заново и те разделы, на которые ответ уже есть")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--max-tokens", type=int, help="предел ответа: 16000, с --think 80000 (размышление входит в предел)")
-    # Размышление по умолчанию включено: склейки персонажей заметно полнее и без ошибок (проверено на «Идиоте»).
-    parser.add_argument("--no-think", dest="think", action="store_false", help="без размышления: в 5–15 раз быстрее, но менее точно")
+    # Thinking improves recall in our samples but is not a correctness guarantee.
+    parser.add_argument("--no-think", dest="think", action="store_false", help="выключить размышление (по умолчанию включено)")
 
 
 def main() -> None:
