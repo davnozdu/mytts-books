@@ -1138,10 +1138,21 @@ def llm(args) -> None:
             content = reply.pop("content")
             answer = parse_answer(content)
             if reply.get("done_reason") == "length" or not (check(answer) if check else valid_response(answer, verify)):
+                # Причина и сам ответ — для разбора: оборван по лимиту, нет JSON или JSON не той формы.
+                if reply.get("done_reason") == "length":
+                    why = f"оборван по лимиту {limit} токенов"
+                elif answer is None:
+                    why = "в ответе нет целого JSON"
+                else:
+                    why = "JSON не той формы или неполный"
+                why += (f" (ответ {len(content)} знаков, размышление {reply.get('thinking_chars')} знаков, "
+                        f"токенов {reply.get('prompt_tokens')}→{reply.get('output_tokens')})")
+                with open(os.path.join(folder, f"{name}.failed{attempt}.txt"), "w", encoding="utf-8") as f:
+                    f.write(content)
                 if attempt < 3:
-                    print(f"  [{name}] неполный или некорректный ответ; повторяем ({attempt + 1}/3)", flush=True)
+                    print(f"  [{name}] {why}; повторяем ({attempt + 1}/3)", flush=True)
                     continue
-                raise ValueError("LLM не вернула полный JSON нужного формата; ответ не сохранён")
+                raise ValueError(f"LLM не вернула полный JSON нужного формата: {why}; ответ не сохранён")
             meta = dict(reply, provider=args.provider, model=args.model, content_chars=len(content),
                         request_sha256=identity(prompt), thinking=args.think, endpoint=args.endpoint, max_tokens=requested_limit, effective_max_tokens=limit, input_sha256=input_sha,
                         seconds=round(time.time() - started, 1), attempt=attempt)
