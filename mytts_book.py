@@ -1629,8 +1629,7 @@ def label_targets(r: dict, answer: dict, by_id: dict) -> list[tuple[str, str]]:
     other = answer.get("other", [])
     for ref in dict.fromkeys(other if isinstance(other, list) else []):
         c = by_id.get(ref) if isinstance(ref, str) and ref in r["candidates"] else None
-        if c and c["kind"] == "title" and len(c.get("contexts") or []) >= MIN_LABEL_ANSWERS \
-                and (c["speaker"] >= 2 or c["count"] >= 10):
+        if c and c["kind"] == "title" and len(c.get("contexts") or []) >= MIN_LABEL_ANSWERS and c["speaker"] >= 2:
             out.append(("", ref))
     return out
 
@@ -1856,7 +1855,8 @@ def label_decision(votes: collections.Counter, owner: str, minimum: int = MIN_LA
     return enough and own >= DOMINANCE * known, own, known
 
 
-def title_plan(whos: list, where: list, sections: list, people: set, hint: str = "") -> tuple[dict, dict]:
+def title_plan(whos: list, where: list, sections: list, people: set, hint: str = "",
+               sole_title_people: frozenset = frozenset()) -> tuple[dict, dict]:
     """Чьё обращение в каждой главе. Генерал может «кочевать»: в одних главах это Епанчин, в других Иволгин.
     Глава с уверенным большинством ответов — за этим человеком; с разногласием — «прочие»; с одним-двумя
     упоминаниями — как соседние главы до и после, если они решены одинаково, иначе как вся книга.
@@ -1867,7 +1867,10 @@ def title_plan(whos: list, where: list, sections: list, people: set, hint: str =
 
     every = collections.Counter(whos)
     best = top(every)
-    whole = best if best and label_decision(every, best)[0] and (not hint or hint == best) else None
+    # Основной разбор отдал обращение другому — оно остаётся спорным, кроме случая, когда тот «другой» —
+    # персонаж из одного этого обращения («начальник»), а отрывки, где он был в списке, назвали другого.
+    agrees = not hint or hint == best or hint in sole_title_people
+    whole = best if best and label_decision(every, best)[0] and agrees else None
     state = {}
     for sid in sections:
         votes = collections.Counter(who for who, w in zip(whos, where) if w == sid)
@@ -2136,7 +2139,9 @@ def apply(args) -> None:
                 continue  # нет ответа по отрывкам — действуют прежние строгие правила
             if candidates[ref]["kind"] == "title":
                 where = candidates[ref].get("context_sections") or [r["sections"][0]] * len(whos)
-                plans[ref], report[ref] = title_plan(whos, where, r["sections"], people, raw_id)
+                sole = frozenset(str(ch.get("id", "")) for ch in answer.get("characters", []) if isinstance(ch, dict)
+                                 and [x for x in ch.get("candidates", []) if x in candidates] == [ref])
+                plans[ref], report[ref] = title_plan(whos, where, r["sections"], people, raw_id, sole)
             elif raw_id:
                 labels[(raw_id, ref)] = collections.Counter(whos)
                 report[ref] = {"votes": dict(collections.Counter(whos).most_common()), "whole": raw_id}
@@ -2230,8 +2235,12 @@ def voices(args) -> None:
         leads = by_rank[:PROTAGONISTS]
         order = leads + sorted(by_rank[PROTAGONISTS:], key=lambda ch: (-ch["speaker"], -ch["mentions"], ch["id"]))
         holders: dict[str, list] = collections.defaultdict(list)
+        lead_ids = {ch["id"] for ch in leads}
         for ch in order:
-            main = ch["gender"] in ("m", "f") and (ch["speaker"] >= args.min_speaker or ch["mentions"] >= args.min_mentions)
+            # Часто упоминаемый без реплик — свой голос только у главных героев: исторические лица
+            # научно-популярной книги («Конфуций», «Мао Цзэдун») не говорят, и голос им не нужен.
+            main = ch["gender"] in ("m", "f") and (ch["speaker"] >= args.min_speaker or (
+                ch["mentions"] >= args.min_mentions and (ch["speaker"] > 0 or ch["id"] in lead_ids)))
             if not main or not pool.get(ch["gender"]):
                 ch["voice"] = spec["other_" + ch["gender"]] if ch["gender"] in ("m", "f") else spec["narrator"]
                 ch["role"] = "other"
