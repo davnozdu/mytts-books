@@ -555,7 +555,9 @@ class Extractor:
         if any(p.tag.POS in ("INTJ", "PRCL", "CONJ", "PREP", "NPRO") for p in parses):
             return False
         tagged = any({"Name", "Surn", "Patr"} & set(p.tag.grammemes) for p in parses)
-        if not tagged and {"Geox", "Orgn"} & set(parses[0].tag.grammemes):
+        # «Москва», «Газпром» из словаря — не люди; но угаданное для незнакомого слова «название организации»
+        # («Мозес» 42 раза с заглавной внутри предложения) — не повод отбросить имя.
+        if not tagged and {"Geox", "Orgn"} & set(parses[0].tag.grammemes) and (parses[0].is_known or self.capital_inside[k] < 3):
             return False
         if {"ADJF", "Poss"} <= set(parses[0].tag.grammemes) or self.possessive(k):  # «Зинина», «Лидиной» — чьё-то
             return False
@@ -648,8 +650,11 @@ class Extractor:
             fallback = self.unknown_base(low, agreed_gender)
             # Сама форма из текста — ключ, только если она похожа на именительный уменьшительного имени
             # («Владя» по словарю — падеж несуществующего «Владь»), но не «Афанасием» или «Ивановича».
-            as_written = fallback == low and low.endswith(("а", "я")) and self.capitalized[low] >= 3 \
-                and all("Name" in p.tag.grammemes for p in opt)
+            as_written = fallback == low and self.capitalized[low] >= 3 and all("Name" in p.tag.grammemes for p in opt) \
+                and (low.endswith(("а", "я")) or (all(self.capitalized[f] == 0 for f in forms) and not any(
+                    self.capitalized[x.word.replace("ё", "е")] > 0 for p in opt for x in p.lexeme if x.word != low)))
+            # «Кэле», «Мити»: несклоняемое иностранное имя — словарь видит падеж («Кэля», «Митя»), которого
+            # в книге нет ни разу; ключ — как написано.
             if (fallback != low or as_written) and fallback not in forms and all(self.capitalized[f] == 0 for f in forms) \
                     and self.capitalized[fallback] > 0:
                 forms[fallback] = forms[max(forms, key=lambda f: self.capitalized[f])]
@@ -660,7 +665,9 @@ class Extractor:
             key = max(forms, key=lambda f: (self.capitalized[f], f == low))
             chosen = forms[key][0]
             keys.append(key)
-            nominative = nominative and any(p.tag.case == "nomn" for p in forms[key])
+            # Несклоняемое (как написано, других форм в книге нет) — в любом падеже, в том числе подлежащее.
+            indeclinable = key == low and as_written and not low.endswith(("а", "я"))
+            nominative = nominative and (indeclinable or any(p.tag.case == "nomn" for p in forms[key]))
             gender = "f" if chosen.tag.gender == "femn" else "m" if chosen.tag.gender == "masc" else None
             info.append((gender, next(r for r in ("Name", "Patr", "Surn") if r in chosen.tag.grammemes)))
         return " ".join(keys), info, family, nominative
@@ -935,8 +942,11 @@ class Extractor:
             low = x.group().lower()
             if x.group()[0].isupper() or low in TITLES:
                 return  # имя или обращение уже учтены как упоминание
+            if p.tag.POS == "NPRO" and p.tag.case != "nomn":
+                continue  # «— отвечал ему собеседник»
+            # Профессия мужского рода у женщины («— спросила орнитолог»): род берётся у глагола.
             if p.tag.POS == "NOUN" and p.tag.case == "nomn" and "anim" in p.tag.grammemes and "sing" in p.tag.grammemes \
-                    and p.tag.gender == parsed.tag.gender:
+                    and (p.tag.gender == parsed.tag.gender or p.tag.gender == "masc"):
                 describe(p.normal_form.replace("ё", "е"), start + x.start(), start + x.end(), parsed.tag.gender)
                 return
             if {"Apro", "Anum"} & set(p.tag.grammemes) or p.normal_form in NOT_DESCRIPTORS:

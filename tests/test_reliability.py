@@ -289,6 +289,18 @@ class ExtractorTests(unittest.TestCase):
         self.assertEqual(1, c[(0, "лорен")].speaker)
         self.assertEqual(1, c[(0, "аркаша")].speaker)
 
+    def test_indeclinable_foreign_name_is_subject(self):
+        c = self.extract(["Пришла Кэле. Ушла Кэле. Видела Кэле.", "— Помнишь меня? — шепчет Кэле."])
+        self.assertEqual(1, c[(0, "кэле")].speaker)
+
+    def test_declinable_name_keeps_nominative_key(self):
+        c = self.extract(["Он говорил об Анфисе Алексеевне. Он ждал Анфисы Алексеевны. Анфисы Алексеевны не было."])
+        self.assertNotIn((0, "анфисы алексеевны"), c)
+
+    def test_guessed_organisation_is_a_name_when_capitalised_inside(self):
+        c = self.extract(["Пришёл Мозес. Ушёл Мозес. Видел Мозеса.", "— Август? — заволновался Мозес."])
+        self.assertEqual(1, c[(0, "мозес")].speaker)
+
     def test_nickname_with_plural_only_parse_is_one_person(self):
         c = self.extract(["– Живем, – обрадовался Санек.", "– Рожу видел! – не сдавался Санек."])
         self.assertEqual("name", c[(0, "санек")].kind)
