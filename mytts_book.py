@@ -6,7 +6,6 @@
 
   python mytts_book.py process book.epub                      # Ollama Cloud, ключ OLLAMA_API_KEY
   python mytts_book.py process book.epub --provider deepseek  # API DeepSeek, ключ DEEPSEEK_API_KEY
-  python mytts_book.py process book.epub --provider groq      # Groq (Qwen 3.8 27B), ключ GROQ_API_KEY
 
 Скрипт сам находит имена, фамилии, отчества, прозвища и обращения (морфология pymorphy3 и статистика книги),
 LLM только сопоставляет их: какие формы — один персонаж. Сомнительное уходит в «прочие». Роман или сборник
@@ -23,7 +22,6 @@ import json
 import os
 import re
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -618,23 +616,18 @@ def save(folder: str, name: str, data) -> None:
         json.dump(data, f, ensure_ascii=False, indent=1)
 
 
-# ---------------------------------------------------------------- LLM: Ollama Cloud, API DeepSeek или Groq
+# ---------------------------------------------------------------- LLM: Ollama Cloud или API DeepSeek
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-USER_AGENT = "mytts-books/1.0 (+https://github.com/davnozdu/mytts-books)"
 PROVIDERS = {
     "ollama": {"endpoint": "https://ollama.com", "model": "deepseek-v4.1-flash", "key": "OLLAMA_API_KEY"},
     "deepseek": {"endpoint": "https://api.deepseek.com", "model": "deepseek-flash", "key": "DEEPSEEK_API_KEY"},
-    "groq": {"endpoint": "https://api.groq.com/openai/v1", "model": "qwen/qwen3.8-27b", "key": "GROQ_API_KEY"},
 }
-# Предел ответа по умолчанию: с размышлением / без. У Groq (Qwen3.8-27B) выход не больше 16384 токенов.
+# Предел ответа по умолчанию: с размышлением / без его.
 MAX_TOKENS = {
     "ollama": {"think": 80000, "plain": 16000},
     "deepseek": {"think": 64000, "plain": 16000},
-    "groq": {"think": 16000, "plain": 16000},
 }
-# Запросов в минуту: у Groq free-тир всего 30/мин, 1000/день и 8K токенов/мин — темп режем, чтобы не упираться в лимит.
-REQUESTS_PER_MINUTE = {"ollama": 120, "deepseek": 120, "groq": 10}
 
 
 class LLMError(RuntimeError):
@@ -655,25 +648,6 @@ class LLMError(RuntimeError):
             return default
 
 
-class Pace:
-    """Не чаще N запросов в минуту: потоки ждут очереди, а не бьют в лимит провайдера одновременно."""
-
-    def __init__(self, per_minute: int) -> None:
-        self.gap = 60.0 / per_minute if per_minute > 0 else 0.0
-        self.lock = threading.Lock()
-        self.next_at = 0.0
-
-    def wait(self) -> None:
-        if self.gap <= 0:
-            return
-        with self.lock:
-            now = time.monotonic()
-            delay = max(0.0, self.next_at - now)
-            self.next_at = max(now, self.next_at) + self.gap
-        if delay > 0:
-            time.sleep(delay)
-
-
 def load_env() -> None:
     """Ключи из файла .env рядом со скриптом или в текущей папке (строки KEY=VALUE); переменные окружения главнее."""
     for folder in (HERE, os.getcwd()):
@@ -689,46 +663,38 @@ def load_env() -> None:
 
 def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str, think: bool, max_tokens: int, timeout: int) -> dict:
     """Один запрос. Возвращает content, thinking (длина), причину остановки и токены в общем виде."""
-    base = endpoint.rstrip("/")
-    if provider == "ollama":
-        url = base + "/api/chat"
+    if provider == "deepseek":
+        # Оригинальный API DeepSeek (api.deepseek.com): размышление — thinking, ответ — в reasoning_content.
+        url = endpoint.rstrip("/") + "/chat/completions"
+        body = {"model": model, "stream": False, "max_tokens": max_tokens, "temperature": 0,
+                "thinking": {"type": "enabled" if think else "disabled"},
+                "messages": [{"role": "user", "content": prompt}]}
+        if think:
+            body["reasoning_effort"] = "high"
+    else:
+        url = endpoint.rstrip("/") + "/api/chat"
         body = {"model": model, "stream": False, "think": think, "options": {"temperature": 0, "num_predict": max_tokens},
                 "messages": [{"role": "user", "content": prompt}]}
-        headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
-    else:
-        url = base + "/chat/completions"
-        body = {"model": model, "stream": False, "max_tokens": max_tokens, "temperature": 0,
-                "messages": [{"role": "user", "content": prompt}]}
-        if provider == "deepseek":
-            # Оригинальный API DeepSeek (api.deepseek.com): размышление — thinking, ответ — в reasoning_content.
-            body["thinking"] = {"type": "enabled" if think else "disabled"}
-            if think:
-                body["reasoning_effort"] = "high"
-        elif provider == "groq":
-            # Groq (Qwen): размышление — это reasoning_effort; "none" выключает, ответ — в message.reasoning.
-            # User-Agent обязателен: без него Cloudflare отдаёт 403 (error code 1010), а не 401.
-            body["reasoning_effort"] = "medium" if think else "none"
-        headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key, "User-Agent": USER_AGENT}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             data = json.loads(response.read())
     except urllib.error.HTTPError as e:  # текст ошибки сервиса, без ключа
         retry = e.headers.get("retry-after") if e.headers else None
         raise LLMError(e.code, e.read().decode("utf-8", "replace")[:300], retry) from None
-    if provider == "ollama":
-        message = data.get("message", {})
-        return {"content": message.get("content", ""), "thinking_chars": len(message.get("thinking") or ""),
-                "done_reason": data.get("done_reason"), "prompt_tokens": data.get("prompt_eval_count"),
-                "output_tokens": data.get("eval_count")}
-    choice = data["choices"][0]
-    message = choice.get("message", {})
-    usage = data.get("usage", {})
-    # DeepSeek кладёт размышление в reasoning_content, Groq (Qwen) — в reasoning; берём то, что есть.
-    thinking = message.get("reasoning_content") or message.get("reasoning") or ""
-    return {"content": message.get("content") or "", "thinking_chars": len(thinking),
-            "done_reason": choice.get("finish_reason"), "prompt_tokens": usage.get("prompt_tokens"),
-            "output_tokens": usage.get("completion_tokens")}
+    if provider == "deepseek":
+        choice = data["choices"][0]
+        message = choice.get("message", {})
+        usage = data.get("usage", {})
+        thinking = message.get("reasoning_content") or message.get("reasoning") or ""
+        return {"content": message.get("content") or "", "thinking_chars": len(thinking),
+                "done_reason": choice.get("finish_reason"), "prompt_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens")}
+    message = data.get("message", {})
+    return {"content": message.get("content", ""), "thinking_chars": len(message.get("thinking") or ""),
+            "done_reason": data.get("done_reason"), "prompt_tokens": data.get("prompt_eval_count"),
+            "output_tokens": data.get("eval_count")}
 
 
 def llm(args) -> None:
@@ -743,7 +709,6 @@ def llm(args) -> None:
     by_id = {c["id"]: c for c in json.load(open(os.path.join(args.dir, "candidates.json"), encoding="utf-8"))["candidates"]}
     folder = os.path.join(args.dir, "answers")
     os.makedirs(folder, exist_ok=True)
-    pace = Pace(REQUESTS_PER_MINUTE.get(args.provider, 60))
 
     def chat(prompt: str, name: str) -> str:
         """Один запрос; ответ в answers/NAME.json, служебные поля (причина остановки, токены) — в NAME.meta.json.
@@ -752,7 +717,6 @@ def llm(args) -> None:
         limit = args.max_tokens or MAX_TOKENS.get(args.provider, MAX_TOKENS["ollama"])["think" if args.think else "plain"]
         delay = 2.0
         for attempt in range(1, 4):
-            pace.wait()
             started = time.time()
             try:
                 reply = request_chat(args.provider, args.endpoint, args.model, key, prompt, args.think, limit, args.timeout)
@@ -784,9 +748,8 @@ def llm(args) -> None:
 
     started = time.time()
     todo = [r for r in request["requests"] if args.redo or load_answer(os.path.join(folder, r["name"] + ".json")) is None]
-    pace_note = f", темп ≤{REQUESTS_PER_MINUTE.get(args.provider, 60)}/мин" if REQUESTS_PER_MINUTE.get(args.provider, 60) < 60 else ""
     print(f"Запросов {len(todo)} из {len(request['requests'])} (остальные уже есть), {args.provider}: {args.model}, "
-          f"размышление {'вкл' if args.think else 'выкл'}, одновременно {args.parallel}{pace_note}", flush=True)
+          f"размышление {'вкл' if args.think else 'выкл'}, одновременно {args.parallel}", flush=True)
     with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
         for r, line in zip(todo, pool.map(lambda r: safe(ask, r), todo)):
             print(f"  [{r['name']}] {r['title']}: {line}", flush=True)
@@ -1098,9 +1061,8 @@ def process(args) -> None:
 
 
 def add_llm_options(parser) -> None:
-    parser.add_argument("--provider", choices=sorted(PROVIDERS), default="ollama",
-                        help="ollama (Ollama Cloud), deepseek (API DeepSeek) или groq (Qwen 3.8 27B)")
-    parser.add_argument("--model", help="по умолчанию: ollama — deepseek-v4.1-flash, deepseek — deepseek-flash, groq — qwen/qwen3.8-27b")
+    parser.add_argument("--provider", choices=sorted(PROVIDERS), default="ollama", help="ollama (Ollama Cloud) или deepseek (API DeepSeek)")
+    parser.add_argument("--model", help="по умолчанию: ollama — deepseek-v4.1-flash, deepseek — deepseek-flash")
     parser.add_argument("--endpoint", help="адрес сервиса, если не стандартный (например, свой сервер Ollama)")
     parser.add_argument("--parallel", type=int, default=1, help="одновременных запросов (по умолчанию по одному)")
     parser.add_argument("--redo", action="store_true", help="спросить заново и те разделы, на которые ответ уже есть")
