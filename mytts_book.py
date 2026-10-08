@@ -445,16 +445,33 @@ class Extractor:
             offset = end
             if index % 2 == 0:
                 continue
-            inside = [m for m in mentions if start <= m.start < end and m.nominative]
+            # A dash inside a spoken sentence is not necessarily a narrator's remark.
+            # Only a nearby subject and past-tense verb in the opening clause count.
+            clause = re.split(r"[.!?…;]", part, maxsplit=1)[0][:180]
+            inside = [m for m in mentions if start <= m.start < start + len(clause)
+                      and m.end <= start + len(clause) and m.nominative and m.cand.kind != "family"]
             if not inside:
                 continue
-            past = [p for p in (self.first(w.group()) for w in WORD.finditer(part)) if p.tag.POS == "VERB" and "past" in p.tag.grammemes]
-            if not past:
+            pairs = []
+            for w in WORD.finditer(clause):
+                parsed = self.first(w.group())
+                if parsed.tag.POS != "VERB" or "past" not in parsed.tag.grammemes:
+                    continue
+                for mention in inside:
+                    left, right = sorted(((mention.start-start, mention.end-start), (w.start(), w.end())))
+                    gap = clause[left[1]:right[0]]
+                    if len(gap) > 48 or re.search(r"[,.:;!?…]", gap):
+                        continue
+                    if any(other != mention and left[1] <= other.start-start < right[0] for other in inside):
+                        continue
+                    pairs.append((len(gap), mention, parsed))
+            if not pairs:
                 continue
-            speaker = inside[0].cand
+            _, mention, verb = min(pairs, key=lambda pair: pair[0])
+            speaker = mention.cand
             speaker.speaker += 1
-            if past[0].tag.gender in ("masc", "femn"):
-                speaker.genders["verb:" + ("f" if past[0].tag.gender == "femn" else "m")] += 1
+            if verb.tag.gender in ("masc", "femn"):
+                speaker.genders["verb:" + ("f" if verb.tag.gender == "femn" else "m")] += 1
 
 
 def snippet(text: str, start: int, end: int, width: int = 70) -> str:

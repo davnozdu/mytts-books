@@ -179,6 +179,20 @@ class ExtractorTests(unittest.TestCase):
         c = self.extract(["Он спросил про Рогожиных. Он спросил про Рогожиных."])
         self.assertEqual("family", c[(0, "семья рогожин")].kind)
 
+    def test_internal_dash_does_not_make_mentioned_person_speaker(self):
+        c = self.extract(["— Садитесь, — сказал генерал. — Нина Александровна и Варвара Александровна, — дамы, которых я уважаю. Нина Александровна примет вас, а я уже закончил разговор."])
+        self.assertEqual(1, c[(0,"генерал")].speaker)
+        self.assertEqual(0, c[(0,"нина александровна")].speaker)
+
+    def test_speaker_is_near_reporting_verb_not_first_mentioned_person(self):
+        c = self.extract(["— Здравствуйте, — к Ивану Петровичу подошёл Николай Павлович. — Я ждал."])
+        self.assertEqual(1, c[(0,"николай павлович")].speaker)
+        self.assertEqual(0, c[(0,"иван петрович")].speaker)
+
+    def test_reporting_verb_with_adverbial_phrase(self):
+        c = self.extract(["— Да, — отвечал в раздумьи чиновник. — Конечно, — тормошился чиновник."])
+        self.assertEqual(2, c[(0,"чиновник")].speaker)
+
 
 class ResponseTests(unittest.TestCase):
     def test_failed_atomic_write_preserves_previous_file(self):
