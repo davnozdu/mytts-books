@@ -62,6 +62,18 @@ class CastTests(unittest.TestCase):
         plan, _ = b.title_plan(["e", "e", "other"], ["s1"] * 3, ["s1"], {"e", "i"})
         self.assertEqual({"s1": None}, plan)  # без основного разбора — строгий порог
 
+    def test_passages_cannot_reassign_title_from_main_answer(self):
+        plan, _ = b.title_plan(["f"] * 5, ["s1"] * 5, ["s1"], {"l", "f"}, hint="l")
+        self.assertEqual({"s1": None}, plan)
+        plan, _ = b.title_plan(["f"] * 5, ["s1"] * 5, ["s1"], {"l", "f", "boss"}, hint="boss", sole_title_people=frozenset({"boss"}))
+        self.assertEqual({"s1": "f"}, plan)
+
+    def test_title_passages_are_asked_per_chapter(self):
+        by_id = {"c1": dict(candidate("чиновник", "title"), contexts=["а"] * 5, context_sections=["s1", "s1", "s1", "s4", "s4"])}
+        r = dict(candidates=["c1"], title="Т")
+        parts = [(lo, hi) for _, _, lo, hi in b.label_requests(r, {"characters": []}, by_id, "c1", False)]
+        self.assertEqual([(0, 3), (3, 5)], parts)
+
     def test_unverified_merge_is_other(self):
         result = self.cast([character("n", ["c1", "c2"])])
         self.assertEqual(["c2"], result["characters"][0]["candidates"])

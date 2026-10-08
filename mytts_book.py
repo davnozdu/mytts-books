@@ -1686,7 +1686,17 @@ def label_targets(r: dict, answer: dict, by_id: dict) -> list[tuple[str, str]]:
 def label_requests(r: dict, answer: dict, by_id: dict, ref: str, collection: bool) -> list[tuple[str, str, int, int]]:
     """(суффикс имени файла, запрос, начало, конец) — отрывки порциями по LABEL_BATCH."""
     total = len(by_id[ref]["contexts"])
-    parts = [(lo, min(total, lo + LABEL_BATCH)) for lo in range(0, total, LABEL_BATCH)]
+    where = by_id[ref].get("context_sections") or []
+    if by_id[ref]["kind"] == "title" and len(set(where)) > 1 and len(where) == total:
+        # Обращение в романе — отдельный запрос на главу: «молодой чиновник, по фамилии Фердыщенко» из одной
+        # главы не должен подсказать ответ для «чиновника» другой главы.
+        parts, lo = [], 0
+        for i in range(1, total + 1):
+            if i == total or where[i] != where[lo] or i - lo >= LABEL_BATCH:
+                parts.append((lo, i))
+                lo = i
+    else:
+        parts = [(lo, min(total, lo + LABEL_BATCH)) for lo in range(0, total, LABEL_BATCH)]
     return [(f".label.{ref}" if len(parts) == 1 else f".label.{ref}.{n}", label_prompt(r, answer, by_id, ref, collection, lo, hi), lo, hi)
             for n, (lo, hi) in enumerate(parts, 1)]
 
@@ -1928,6 +1938,8 @@ def title_plan(whos: list, where: list, sections: list, people: set, hint: str =
             continue
         lead = top(votes)
         keep, own, known = label_decision(votes, lead, MIN_CHAPTER_ANSWERS) if lead else (False, 0, 0)
+        if keep and hint and lead != hint and hint not in sole_title_people:
+            keep, own = False, 0  # отрывки против основного разбора: не перевешиваем, а оставляем в «прочих»
         rivals = sum(n for who, n in votes.items() if who in people and who != lead)
         if not keep and lead and lead == hint and not rivals and known >= MIN_CHAPTER_ANSWERS and own >= AGREED_DOMINANCE * known:
             keep = True  # «чиновник» в 1-й главе: основной разбор — Лебедев, отрывки — Лебедев 2, «не знаю» 1
