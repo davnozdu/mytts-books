@@ -446,6 +446,56 @@ class ResumeTests(unittest.TestCase):
         cast = b.read_json(str(self.folder/"cast.json"))["casts"][0]
         self.assertEqual(["c2", "c1", "c3"], cast["characters"][0]["candidates"])
 
+    def test_deepseek_provider_runs_whole_llm_stage(self):
+        """Оригинальный API DeepSeek: /chat/completions, размышление, три ответа, отрывки, проверка склеек."""
+        self.candidates["c3"] = candidate("генерал", "title", source="Title", count=5)
+        self.candidates["c3"]["contexts"] = ["[[генерал]] вошёл"] * 3
+        self.r["candidates"] = list(self.candidates)
+        b.save(str(self.folder), "candidates.json", {"candidates": [dict(c,id=k) for k,c in self.candidates.items()]})
+        b.save(str(self.folder), "llm_request.json", {"scope":"book", "requests":[self.r]})
+        answer = {"characters":[character("n",["c1","c2","c3"])],"other":[]}
+        checks = {"checks":[dict(character="n", anchor="c2", candidate="c1", verdict="same"),
+                            dict(character="n", anchor="c2", candidate="c3", verdict="same")]}
+        sent = []
+
+        class Response(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            sent.append((req.full_url, body, req.get_header("Authorization")))
+            prompt = body["messages"][0]["content"]
+            if prompt.startswith("Проверка"):
+                reply = checks
+            elif prompt.startswith("Кто назван"):
+                reply = {"answers": [{"n": n, "who": "n"} for n in range(1, 4)]}
+            else:
+                reply = answer
+            data = {"choices": [{"message": {"content": json.dumps(reply), "reasoning_content": "…"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+            return Response(json.dumps(data).encode())
+
+        self.args.provider, self.args.model, self.args.endpoint, self.args.votes = "deepseek", None, None, 3
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "not-a-real-key"}), patch.object(b, "load_env"), \
+                patch.object(b.urllib.request, "urlopen", side_effect=urlopen), contextlib.redirect_stdout(io.StringIO()):
+            b.llm(self.args)
+        self.assertEqual(5, len(sent))
+        for url, body, auth in sent:
+            self.assertEqual("https://api.deepseek.com/chat/completions", url)
+            self.assertEqual("deepseek-flash", body["model"])
+            self.assertEqual({"type": "enabled"}, body["thinking"])
+            self.assertEqual("high", body["reasoning_effort"])
+            self.assertEqual("Bearer not-a-real-key", auth)
+
+    def test_deepseek_token_limit_error_is_understood(self):
+        error = b.urllib.error.HTTPError("https://api.deepseek.com", 400, "bad", {}, io.BytesIO(json.dumps(
+            {"error": {"message": "Invalid max_tokens value, the valid range of max_tokens is [1, 65536]"}}).encode()))
+        with patch.object(b.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(b.LLMError) as caught:
+                b.request_chat("deepseek", "https://api.deepseek.com", "deepseek-flash", "k", "p", True, 80000, 10)
+        self.assertEqual(65536, caught.exception.max_output_tokens)
+
     def test_resume_missing_verification_only(self):
         self.run_llm(); self.assertEqual(2,len(self.calls))
         (self.folder/"answers/book.verify.json").unlink()
@@ -521,6 +571,40 @@ class ResumeTests(unittest.TestCase):
     def test_api_failure_stops_pipeline(self):
         def failed(*args): raise b.LLMError(401,"denied")
         with self.assertRaises(RuntimeError): self.run_llm(failed)
+
+
+class Fb2Tests(unittest.TestCase):
+    XML = ('<?xml version="1.0" encoding="windows-1251"?><FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
+           '<description><title-info><author><first-name>Иван</first-name><last-name>Петров</last-name></author>'
+           '<book-title>Рассказы</book-title></title-info></description>'
+           '<body><title><p>Рассказы</p></title>'
+           '<section><title><p>Первый</p></title><p>Зина пришла домой.</p><section><p>Зина ушла.</p></section></section>'
+           '<section><title><p>Второй</p></title><poem><stanza><v>Павлуша пел.</v></stanza></poem></section></body>'
+           '<body name="notes"><section><p>Сноска про Ванду.</p></section></body></FictionBook>')
+
+    def check(self, book):
+        self.assertEqual("Рассказы", book.title)
+        self.assertEqual("Иван Петров", book.author)
+        self.assertEqual(["Первый", "Второй"], [s["title"] for s in book.sections])
+        texts = [t for _, t in book.paragraphs]
+        self.assertIn("Зина ушла.", texts)
+        self.assertIn("Павлуша пел.", texts)
+        self.assertNotIn("Сноска про Ванду.", texts)
+        self.assertEqual(1, dict((t, s) for s, t in book.paragraphs)["Павлуша пел."])
+
+    def test_fb2_in_windows_1251(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "book.fb2")
+            Path(path).write_bytes(self.XML.encode("cp1251"))
+            self.check(b.read_book(path))
+
+    def test_zipped_fb2(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "book.fb2.zip")
+            import zipfile
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("book.fb2", self.XML.encode("cp1251"))
+            self.check(b.read_book(path))
 
 
 class ExportTests(unittest.TestCase):

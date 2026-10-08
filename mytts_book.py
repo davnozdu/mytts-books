@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MyTTS · подготовка книги к озвучке голосами персонажей.
 
-Одна команда — EPUB на входе, файл .mytts-book на выходе (импорт в MyTTS: настройки LLM → мультиголос →
+Одна команда — EPUB или FB2 на входе, файл .mytts-book на выходе (импорт в MyTTS: настройки LLM → мультиголос →
 «Книги с голосами персонажей» → «Загрузить файл книги»):
 
   python mytts_book.py process book.epub                      # Ollama Cloud, ключ OLLAMA_API_KEY
@@ -117,6 +117,73 @@ def read_epub(path: str) -> Book:
     return Book(title, clean(author), sections, [(renumber[s], t) for s, t in paragraphs])
 
 
+def read_book(path: str) -> Book:
+    """EPUB или FB2 (в том числе .fb2.zip)."""
+    low = path.lower()
+    if low.endswith((".fb2", ".fb2.zip")):
+        return read_fb2(path)
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            if "META-INF/container.xml" not in z.namelist() and any(n.lower().endswith(".fb2") for n in z.namelist()):
+                return read_fb2(path)
+    return read_epub(path)
+
+
+def read_fb2(path: str) -> Book:
+    """FB2: разделы — секции верхнего уровня основного <body> (как верхний уровень оглавления EPUB),
+    абзацы — <p>, строки стихов <v>, подзаголовки и подписи; сноски (<body name="notes">) не читаются."""
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            data = z.read(next(n for n in z.namelist() if n.lower().endswith(".fb2")))
+    else:
+        with open(path, "rb") as f:
+            data = f.read()
+    root = ET.fromstring(data)  # кодировку (часто windows-1251) берёт из заголовка XML
+
+    def local(e) -> str:
+        return e.tag.rsplit("}", 1)[-1]
+
+    def text(e) -> str:
+        return clean(" ".join(e.itertext()))
+
+    info = next((e for e in root.iter() if local(e) == "title-info"), None)
+    title = PurePosixPath(path).stem
+    author = ""
+    if info is not None:
+        title = next((text(e) for e in info if local(e) == "book-title" and text(e)), title)
+        first = next((e for e in info if local(e) == "author"), None)
+        if first is not None:
+            author = " ".join(text(e) for e in first if local(e) in ("first-name", "middle-name", "last-name") and text(e))
+    bodies = [e for e in root if local(e) == "body" and e.get("name") not in ("notes", "comments", "footnotes")]
+    sections: list = []
+    paragraphs: list[tuple[int, str]] = []
+    leaf = {"p", "v", "subtitle", "text-author"}
+
+    def walk(e, section: int) -> None:
+        if local(e) in leaf:
+            line = text(e)
+            if line:
+                paragraphs.append((section, line))
+            return
+        for child in e:
+            walk(child, section)
+
+    for body in bodies:
+        for child in body:
+            if local(child) == "section":
+                heading = next((text(t) for t in child if local(t) == "title"), "")
+                sections.append({"id": f"s{len(sections) + 1}", "title": heading or f"Раздел {len(sections) + 1}"})
+                walk(child, len(sections) - 1)
+            else:  # заголовок книги, эпиграф перед первой секцией
+                walk(child, max(0, len(sections) - 1))
+    if not sections:
+        sections = [{"id": "s1", "title": title}]
+    used = sorted({s for s, _ in paragraphs})
+    renumber = {old: new for new, old in enumerate(used)}
+    sections = [dict(sections[old], id=f"s{renumber[old] + 1}") for old in used]
+    return Book(clean(title), clean(author), sections, [(renumber[s], t) for s, t in paragraphs])
+
+
 def top_level_toc(z, base, items, opf) -> list[tuple[str, str]]:
     nav = next((e for e in items.values() if "nav" in (e.get("properties") or "").split()), None)
     if nav is not None:
@@ -139,7 +206,7 @@ def top_level_toc(z, base, items, opf) -> list[tuple[str, str]]:
     root = ET.fromstring(z.read(str(base / ncx.get("href"))))
     nav_map = next((e for e in root.iter() if e.tag.endswith("}navMap")), None)
     out = []
-    for point in (nav_map or []):
+    for point in (nav_map if nav_map is not None else []):
         if not point.tag.endswith("}navPoint"):
             continue
         label = next((e.text for e in point.iter() if e.tag.endswith("}text") and e.text), "")
@@ -789,7 +856,7 @@ def candidate_line(cid: str, c: Candidate, ids: dict) -> str:
 
 def extract(args) -> None:
     started = time.time()
-    book = read_epub(args.book)
+    book = read_book(args.book)
     extractor = Extractor()
     found = extractor.run(book, per_section=False)
     collection = args.scope == "section" or (args.scope == "auto" and detect_collection(book, found))
@@ -987,8 +1054,12 @@ def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str
         # Keep only the numeric limit; never retain/log arbitrary response bodies.
         try:
             message = json.loads(e.read()).get("error", "")
-            match = re.search(r"maximum output tokens \((\d+)\)", message) if isinstance(message, str) else None
-            cap = int(match.group(1)) if match else None
+            if isinstance(message, dict):  # DeepSeek: {"error": {"message": "...", "type": ...}}
+                message = message.get("message", "")
+            # Ollama: «maximum output tokens (65536)»; DeepSeek: «valid range of max_tokens is [1, 65536]».
+            match = re.search(r"maximum output tokens \((\d+)\)|max_tokens[^\[]*\[\s*1\s*,\s*(\d+)\s*\]", message) \
+                if isinstance(message, str) else None
+            cap = int(match.group(1) or match.group(2)) if match else None
         except (ValueError, TypeError):
             cap = None
         finally:
@@ -1828,7 +1899,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     pr = sub.add_parser("process", help="всё сразу: EPUB → файл .mytts-book для импорта в MyTTS")
-    pr.add_argument("book", help="файл книги .epub")
+    pr.add_argument("book", help="файл книги .epub или .fb2 (.fb2.zip)")
     pr.add_argument("-o", "--out", help="рабочая папка (по умолчанию out/<имя книги>)")
     pr.add_argument("--output", help="путь итогового .mytts-book (по умолчанию в рабочей папке)")
     pr.add_argument("--scope", choices=["auto", "book", "section"], default="auto", help="роман, сборник или определить")
@@ -1836,7 +1907,7 @@ def main() -> None:
     add_llm_options(pr)
     pr.set_defaults(func=process)
     e = sub.add_parser("extract", help="EPUB → кандидаты, запросы к LLM, указатель абзацев")
-    e.add_argument("book")
+    e.add_argument("book", help="файл книги .epub или .fb2 (.fb2.zip)")
     e.add_argument("-o", "--out", required=True)
     e.add_argument("--scope", choices=["auto", "book", "section"], default="auto",
                    help="book — роман, section — сборник рассказов, auto — определить")
