@@ -368,6 +368,7 @@ class ResponseTests(unittest.TestCase):
 
     def test_enum_thinking_and_boolean_thinking(self):
         self.assertEqual("high", b.thinking_control([False,"low","high","max"],True))
+        self.assertEqual("medium", b.thinking_control([False,"low","medium","high"],True))
         self.assertIs(False,b.thinking_control([False,"low","high","max"],False))
         self.assertIs(True,b.thinking_control([False,True],True))
         self.assertIs(False,b.thinking_control([False],True))

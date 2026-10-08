@@ -1003,13 +1003,15 @@ def thinking_control(values: list, enabled: bool):
     if any(v is enabled for v in values):
         return enabled
     levels = [v for v in values if isinstance(v, str)]
-    order = ("high", "max", "medium", "low", "minimal") if enabled else ("minimal", "low", "medium", "high", "max")
+    # «medium», как обычное «think: true» в первых версиях: на «high» модель на большом списке кандидатов
+    # может размышлять до предела ответа и не ответить вовсе.
+    order = ("medium", "high", "low", "max", "minimal") if enabled else ("minimal", "low", "medium", "high", "max")
     if levels:
         return next((v for v in order if v in levels), levels[0])
     return enabled
 
 
-EFFORTS = ("high", "medium", "low")
+EFFORTS = ("max", "high", "medium", "low", "minimal")
 THINK_TEMPERATURE = 0.6
 
 
@@ -1033,8 +1035,13 @@ def ollama_thinking(endpoint: str, model: str, key: str, enabled: bool, effort: 
     values = _THINKING_CONTROLS[cache_key]
     if enabled and values and thinking_control(values, True) is False:
         raise ValueError("Выбранная модель не поддерживает размышление")
-    if enabled and effort and effort in values:
-        return effort  # ступенью ниже, если на прежнем уровне размышление не уложилось в предел ответа
+    if enabled and effort and effort in EFFORTS:
+        # Ступенью ниже, если на прежнем уровне размышление не уложилось в предел ответа: ближайший из
+        # поддерживаемых моделью уровней не выше запрошенного.
+        lower = [v for v in EFFORTS[EFFORTS.index(effort):] if v in values]
+        supported = [v for v in EFFORTS if v in values]
+        if lower or supported:
+            return (lower or supported[-1:])[0]
     return thinking_control(values, enabled)
 
 
@@ -1055,7 +1062,7 @@ def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str
                 "thinking": {"type": "enabled" if think else "disabled"},
                 "messages": [{"role": "user", "content": prompt}]}
         if think:
-            body["reasoning_effort"] = effort or "high"
+            body["reasoning_effort"] = effort if effort in ("high", "medium", "low") else ("low" if effort else "high")
     else:
         url = endpoint.rstrip("/") + "/api/chat"
         body = {"model": model, "stream": False, "think": ollama_thinking(endpoint, model, key, think, effort), "options": {"temperature": temperature(think), "num_predict": max_tokens},
