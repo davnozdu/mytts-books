@@ -992,6 +992,7 @@ def load_env() -> None:
 
 _THINKING_CONTROLS: dict[tuple, list] = {}
 _MODEL_LIMITS: dict[tuple, int] = {}
+_EFFORT_HINT: dict[tuple, str] = {}
 
 
 def thinking_control(values: list, enabled: bool):
@@ -1009,6 +1010,7 @@ def thinking_control(values: list, enabled: bool):
 
 
 EFFORTS = ("high", "medium", "low")
+THINK_TEMPERATURE = 0.6
 
 
 def ollama_thinking(endpoint: str, model: str, key: str, enabled: bool, effort: str | None = None):
@@ -1036,20 +1038,27 @@ def ollama_thinking(endpoint: str, model: str, key: str, enabled: bool, effort: 
     return thinking_control(values, enabled)
 
 
+def temperature(think: bool) -> float:
+    """Размышляющие модели DeepSeek при температуре 0 склонны зацикливаться: размышление повторяется, пока не
+    кончится предел ответа, и ответа нет. Разработчики рекомендуют 0,5–0,7; без размышления — 0 (стабильнее).
+    Ненулевая температура к тому же делает независимыми ответы для голосования."""
+    return THINK_TEMPERATURE if think else 0.0
+
+
 def request_chat(provider: str, endpoint: str, model: str, key: str, prompt: str, think: bool, max_tokens: int, timeout: int,
                  effort: str | None = None) -> dict:
     """Один запрос. Возвращает content, thinking (длина), причину остановки и токены в общем виде."""
     if provider == "deepseek":
         # Оригинальный API DeepSeek (api.deepseek.com): размышление — thinking, ответ — в reasoning_content.
         url = endpoint.rstrip("/") + "/chat/completions"
-        body = {"model": model, "stream": False, "max_tokens": max_tokens, "temperature": 0,
+        body = {"model": model, "stream": False, "max_tokens": max_tokens, "temperature": temperature(think),
                 "thinking": {"type": "enabled" if think else "disabled"},
                 "messages": [{"role": "user", "content": prompt}]}
         if think:
             body["reasoning_effort"] = effort or "high"
     else:
         url = endpoint.rstrip("/") + "/api/chat"
-        body = {"model": model, "stream": False, "think": ollama_thinking(endpoint, model, key, think, effort), "options": {"temperature": 0, "num_predict": max_tokens},
+        body = {"model": model, "stream": False, "think": ollama_thinking(endpoint, model, key, think, effort), "options": {"temperature": temperature(think), "num_predict": max_tokens},
                 "messages": [{"role": "user", "content": prompt}]}
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
@@ -1119,7 +1128,7 @@ def llm(args) -> None:
         model_key = (args.provider, args.endpoint, args.model)
         limit = min(requested_limit, _MODEL_LIMITS.get(model_key, requested_limit))
         delay = 2.0
-        effort = None
+        effort = _EFFORT_HINT.get(model_key)  # прошлый ответ уже не уложился — сразу короче
         for attempt in range(1, 4):
             started = time.time()
             try:
@@ -1163,6 +1172,7 @@ def llm(args) -> None:
                         # Размышление не уложилось в предел ответа: следующая попытка — ступенью короче, но с размышлением.
                         current = effort or reply.get("thinking_control") or "high"
                         effort = EFFORTS[min(len(EFFORTS) - 1, EFFORTS.index(current) + 1)] if current in EFFORTS else "medium"
+                        _EFFORT_HINT[model_key] = effort
                         why += f"; размышление: {effort}"
                     print(f"  [{name}] {why}; повторяем ({attempt + 1}/3)", flush=True)
                     continue
@@ -1185,16 +1195,22 @@ def llm(args) -> None:
             line = "основной ответ из кэша" if cached(r["prompt"], name) else chat(r["prompt"], name)
         else:
             # Несколько независимых ответов: склейка остаётся, только если её дало большинство.
-            parts = []
+            parts, done = [], []
             for n in range(1, votes + 1):
                 run = f"{name}.run{n}"
-                parts.append(f"{n}: " + ("из кэша" if cached(r["prompt"], run) else chat(r["prompt"], run).split(",")[0]))
-            runs = [load_answer(os.path.join(folder, f"{name}.run{n}.json")) for n in range(1, votes + 1)]
+                try:
+                    parts.append(f"{n}: " + ("из кэша" if cached(r["prompt"], run) else chat(r["prompt"], run).split(",")[0]))
+                    done.append(n)
+                except (ValueError, RuntimeError) as e:  # один ответ не удался — остальные ещё могут дать большинство
+                    parts.append(f"{n}: не получен ({str(e)[:80]})")
+            if len(done) < votes // 2 + 1:
+                raise ValueError(f"получено {len(done)} ответов из {votes}, нужно большинство; повторите запуск")
+            runs = [load_answer(os.path.join(folder, f"{name}.run{n}.json")) for n in done]
             combined = combine_answers(runs, r, by_id)
-            meta = load_answer(os.path.join(folder, f"{name}.run1.meta.json"))
+            meta = load_answer(os.path.join(folder, f"{name}.run{done[0]}.meta.json"))
             save(folder, name + ".json", combined)
-            save(folder, name + ".meta.json", dict(meta, votes=votes, done_reason="stop"))
-            line = f"ответов {votes} ({'; '.join(parts)})"
+            save(folder, name + ".meta.json", dict(meta, votes=len(done), done_reason="stop"))
+            line = f"ответов {len(done)} из {votes} ({'; '.join(parts)})"
         answer = load_answer(os.path.join(folder, name + ".json"))
         line += check_labels(r, answer, name)
         prompt = verify_prompt(r, answer, by_id, request["scope"] == "section") if answer else None

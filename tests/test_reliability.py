@@ -396,6 +396,8 @@ class ResponseTests(unittest.TestCase):
 
 class ResumeTests(unittest.TestCase):
     def setUp(self):
+        b._EFFORT_HINT.clear()
+        self.addCleanup(b._EFFORT_HINT.clear)
         self.temp = tempfile.TemporaryDirectory()
         self.folder = Path(self.temp.name)
         self.candidates = {"c1": candidate("николай"), "c2": candidate("николай петрович")}
@@ -486,6 +488,7 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual("deepseek-flash", body["model"])
             self.assertEqual({"type": "enabled"}, body["thinking"])
             self.assertEqual("high", body["reasoning_effort"])
+            self.assertEqual(0.6, body["temperature"])
             self.assertEqual("Bearer not-a-real-key", auth)
 
     def test_deepseek_token_limit_error_is_understood(self):
@@ -497,6 +500,7 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(65536, caught.exception.max_output_tokens)
 
     def test_length_cut_retries_with_shorter_thinking(self):
+        b._EFFORT_HINT.clear()
         efforts = []
         def chat(*args, effort=None):
             efforts.append(effort)
@@ -506,11 +510,27 @@ class ResumeTests(unittest.TestCase):
         self.run_llm(chat)
         self.assertEqual([None, "medium"], efforts[:2])
         self.assertTrue((self.folder/"answers/book.failed1.txt").exists())
+        b._EFFORT_HINT.clear()
 
     def test_minor_answer_deviations_are_normalized(self):
         answer = b.normalize_answer({"characters": [{"id": 7, "name": None, "gender": "Ж", "candidates": ["c1"]}], "other": []})
         self.assertTrue(b.valid_response(answer))
         self.assertEqual("f", answer["characters"][0]["gender"])
+
+    def test_one_failed_vote_still_gives_majority_of_two(self):
+        calls = []
+        def chat(*args, effort=None):
+            calls.append(effort)
+            if args[4] == "Return JSON" and len(calls) in (2, 3, 4):  # второй ответ трижды обрывается
+                return dict(content="", thinking_chars=9, thinking_control="high", done_reason="length", prompt_tokens=1, output_tokens=80000)
+            return self.chat(*args)
+        self.args.votes = 3
+        b._EFFORT_HINT.clear()
+        self.run_llm(chat)
+        meta = b.load_answer(str(self.folder/"answers/book.meta.json"))
+        self.assertEqual(2, meta["votes"])
+        self.assertEqual("low", calls[4])  # следующие прогоны сразу с коротким размышлением
+        b._EFFORT_HINT.clear()
 
     def test_resume_missing_verification_only(self):
         self.run_llm(); self.assertEqual(2,len(self.calls))
