@@ -1356,9 +1356,16 @@ def label_targets(r: dict, answer: dict, by_id: dict) -> list[tuple[str, str]]:
     for raw in raw_characters if isinstance(raw_characters, list) else []:
         if not isinstance(raw, dict):
             continue
-        for ref in character_refs(raw, r, by_id):
-            if len(by_id[ref].get("contexts") or []) >= MIN_LABEL_ANSWERS:
-                out.append((str(raw.get("id", "")), ref))
+        refs = character_refs(raw, r, by_id)
+        for ref in refs:
+            if len(by_id[ref].get("contexts") or []) < MIN_LABEL_ANSWERS:
+                continue
+            c = by_id[ref]
+            if c["kind"] != "title" and len(refs) == 1 and not any(
+                    by_id[x]["kind"] == "name" and len(by_id[x]["key"].split()) > 1 and by_id[x]["key"].split()[-1] == c["key"]
+                    for x in r["candidates"] if x != ref):
+                continue  # единственное имя персонажа и других носителей фамилии нет: путать не с кем
+            out.append((str(raw.get("id", "")), ref))
     return out
 
 
@@ -1546,6 +1553,8 @@ def load_answer(path: str) -> dict | None:
         return None
 
 
+# Сколько главных героев (по порядку LLM) получают свой голос первыми, независимо от числа реплик.
+PROTAGONISTS = 3
 # Обращение или голая фамилия остаются у персонажа, если в его пользу не меньше этой доли упоминаний.
 DOMINANCE = 0.8
 PATRONYMIC_SHORT = ((r"ович$", "ыч"), (r"евич$", "ич"))
@@ -1830,8 +1839,12 @@ def voices(args) -> None:
     for group in cast["casts"]:
         # Rejected ambiguous titles must not erase the protagonist's voice priority.
         # Legacy casts without model priority keep their previous ordering.
-        order = sorted(group["characters"], key=lambda ch: (ch.get("priority", len(group["characters"])),
-                       -ch["speaker"], -ch["mentions"], ch["id"]))
+        # Главные герои по оценке LLM — первыми (их голос не теряется, даже если обращение «князь» снято);
+        # остальным голосам — тем, кто больше говорит: своих голосов мало, а нужнее всего они говорящим.
+        by_rank = sorted(group["characters"], key=lambda ch: (ch.get("priority", len(group["characters"])),
+                         -ch["speaker"], -ch["mentions"], ch["id"]))
+        leads = by_rank[:PROTAGONISTS]
+        order = leads + sorted(by_rank[PROTAGONISTS:], key=lambda ch: (-ch["speaker"], -ch["mentions"], ch["id"]))
         holders: dict[str, list] = collections.defaultdict(list)
         for ch in order:
             main = ch["gender"] in ("m", "f") and (ch["speaker"] >= args.min_speaker or ch["mentions"] >= args.min_mentions)

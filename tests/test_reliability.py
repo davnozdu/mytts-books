@@ -35,6 +35,13 @@ class CastTests(unittest.TestCase):
         v = b.verification_verdicts(dict(checks=checks or []), a, self.r, self.c)
         return b.build_cast(self.r, a, v, self.c, "")
 
+    def test_sole_surname_of_character_is_not_checked_by_passages(self):
+        c = {"c1": dict(candidate("бахмутов", count=14), contexts=["…"] * 14),
+             "c2": dict(candidate("генерал", "title", count=9), contexts=["…"] * 9)}
+        r = dict(candidates=list(c))
+        answer = {"characters": [character("bakhmutov", ["c1"]), character("general", ["c2"])], "other": []}
+        self.assertEqual([("general", "c2")], b.label_targets(r, answer, c))
+
     def test_unverified_merge_is_other(self):
         result = self.cast([character("n", ["c1", "c2"])])
         self.assertEqual(["c2"], result["characters"][0]["candidates"])
