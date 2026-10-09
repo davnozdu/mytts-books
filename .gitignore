@@ -5,3 +5,4 @@ out/
 __pycache__/
 *.pyc
 *.mytts-book
+venv-tts/
