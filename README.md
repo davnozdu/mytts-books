@@ -234,3 +234,17 @@ venv-tts/bin/python qwen_tts_stress.py текст.txt --ref-audio голос.wav
 Другие параметры: `--temperature 0.7` (ровнее и стабильнее), `--max-chars` (длина куска текста),
 `--pause` (пауза между кусками), `--save-chunks` (сохранить каждый кусок отдельным файлом, удобно для
 проверки), `--seed` (одинаковый результат при повторном запуске).
+
+### Перевести модель в формат MLX (быстрее и меньше памяти)
+
+В репозитории модели лежат веса PyTorch. `mlx-audio` переводит их в MLX при каждой загрузке. Можно один раз
+сохранить готовую MLX-версию, в том числе сжатую до 8 бит (около 3 ГБ вместо ~4,6 ГБ):
+
+```sh
+venv-tts/bin/python -m mlx_audio.convert --hf-path siriusfreak/qwen3-tts-12hz-1.7b-ru-stress-cf \
+    --mlx-path mlx-ru-stress-8bit --quantize --q-bits 8
+venv-tts/bin/python qwen_tts_stress.py текст.txt --model ./mlx-ru-stress-8bit
+```
+
+Без сжатия: `--dtype bfloat16` вместо `--quantize --q-bits 8`. Сжатие до 4 бит (`--q-bits 4`) ещё быстрее, но
+хуже по качеству: ударения после него стоит перепроверить.
